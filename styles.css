@@ -80,7 +80,11 @@ main { max-width: 640px; margin: 0 auto; padding: 0 16px 24px; }
 .bar { height: 8px; border-radius: 99px; background: var(--chip); overflow: hidden; margin-top: 8px; }
 .bar > i { display: block; height: 100%; background: var(--accent); border-radius: 99px; }
 .bar.over > i { background: var(--expense); }
-.budget-line { display: flex; justify-content: space-between; font-size: 13px; }
+.budget-line { display: flex; justify-content: space-between; gap: 8px; font-size: 13px; }
+.budget-cats { border-top: 1px solid var(--line); margin-top: 12px; padding-top: 4px; }
+.budget-cat { display: block; width: 100%; border: 0; background: none; text-align: left; padding: 8px 0; }
+.budget-cat + .budget-cat { border-top: 1px dashed var(--line); }
+.budget-cat .bar { margin-top: 5px; height: 6px; }
 
 /* Search */
 .search { width: 100%; border: 1px solid var(--line); background: var(--card); border-radius: 10px; padding: 9px 12px; margin-top: 4px; }

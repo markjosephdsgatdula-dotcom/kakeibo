@@ -276,6 +276,37 @@ const bar = (used, limit) => {
   return `<div class="bar ${used > limit ? 'over' : ''}"><i style="width:${pct}%"></i></div>`;
 };
 const budgetIn = v => conv(Number(v) || 0, db.budget.currency); // budget amount in display currency
+const leftLabel = (spent, limit, cur = disp()) => spent > limit
+  ? `<span class="neg">Over by ${money(spent - limit, cur)}</span>`
+  : `${money(limit - spent, cur)} left`;
+
+// Budget card for Home: overall budget plus every category that has one, most-used first.
+function budgetCard(list) {
+  const exp = totals(list).exp;
+  const B = budgetIn(db.budget.total);
+  const spent = new Map();
+  for (const t of list) if (t.type === 'expense') spent.set(t.categoryId, (spent.get(t.categoryId) || 0) + val(t));
+  const cats = db.categories
+    .filter(c => c.type === 'expense' && Number(db.budget.cats[c.id]) > 0)
+    .map(c => ({ c, limit: budgetIn(db.budget.cats[c.id]), spent: spent.get(c.id) || 0 }))
+    .sort((a, b) => b.spent / b.limit - a.spent / a.limit);
+  if (!(B > 0) && !cats.length) return '';
+  let html = '<div class="card">';
+  if (B > 0) {
+    html += `<div class="budget-line"><b>Monthly budget</b><span>${leftLabel(exp, B)}</span></div>
+      ${bar(exp, B)}<div class="budget-line muted" style="margin-top:4px;font-size:12px"><span>Spent ${money(exp)}</span><span>of ${money(B)}</span></div>`;
+  }
+  if (cats.length) {
+    html += `<div class="budget-cats" ${B > 0 ? '' : 'style="border-top:0;margin-top:0;padding-top:0"'}>`;
+    for (const { c, limit, spent: s } of cats) {
+      html += `<button class="budget-cat" data-act="catDetail" data-id="${c.id}" data-type="expense">
+        <div class="budget-line"><span>${c.icon} ${esc(c.name)}</span><span>${leftLabel(s, limit)}</span></div>
+        ${bar(s, limit)}<div class="budget-line muted" style="font-size:11px;margin-top:2px"><span>${money(s)}</span><span>of ${money(limit)}</span></div></button>`;
+    }
+    html += '</div>';
+  }
+  return html + '</div>';
+}
 
 /* ---------- views ---------- */
 function viewHome() {
@@ -285,13 +316,7 @@ function viewHome() {
     <div><small>Income</small><b class="pos">${money(inc)}</b></div>
     <div><small>Expense</small><b class="neg">${money(exp)}</b></div>
     <div><small>Balance</small><b>${money(net)}</b></div></div>`;
-  const B = budgetIn(db.budget.total);
-  if (B > 0) {
-    const left = B - exp;
-    html += `<div class="card"><div class="budget-line"><span>Monthly budget</span>
-      <span class="${left < 0 ? 'neg' : ''}">${left < 0 ? 'Over by ' + money(-left) : money(left) + ' left'}</span></div>
-      ${bar(exp, B)}<div class="budget-line muted" style="margin-top:4px;font-size:12px"><span>Spent ${money(exp)}</span><span>of ${money(B)}</span></div></div>`;
-  }
+  html += budgetCard(list);
   html += `<input class="search" type="search" placeholder="Search this month…" value="${esc(ui.q)}" data-input="q">`;
   return html + `<div id="txlist">${homeList(list)}</div>`;
 }
@@ -373,7 +398,7 @@ function viewReport() {
       html += `<button class="row" data-act="catDetail" data-id="${r.id ?? ''}">
         <span class="ico" style="background:${r.c?.color || '#94a3b8'}26">${r.c?.icon || '❔'}</span>
         <span class="main"><span class="t">${esc(r.c?.name || 'Uncategorized')}</span>
-          <span class="sub">${(r.amt / total * 100).toFixed(1)}%${budget ? ` · budget ${money(budget)}` : ''}</span>
+          <span class="sub">${(r.amt / total * 100).toFixed(1)}%${budget ? ` · ${leftLabel(r.amt, budget)} of ${money(budget)}` : ''}</span>
           ${budget ? bar(r.amt, budget) : ''}</span>
         <span class="amt">${money(r.amt)}</span></button>`;
     }
@@ -444,12 +469,12 @@ const SUBVIEWS = {
     let html = `<div class="form"><div class="field"><label>Budget in</label><select data-change="budgetCurrency">${curOptions(bc)}</select></div></div>
       <div class="card"><div class="budget-line"><b>Monthly total</b>
       <input class="budget-input" type="number" min="0" inputmode="decimal" placeholder="None" value="${db.budget.total || ''}" data-change="budgetTotal"></div>
-      ${db.budget.total ? bar(totalSpent, db.budget.total) + `<div class="budget-line muted" style="font-size:12px;margin-top:4px"><span>${monthLabel()}: ${money(totalSpent, bc)}</span><span>${money(db.budget.total, bc)}</span></div>` : ''}</div>
+      ${db.budget.total ? bar(totalSpent, db.budget.total) + `<div class="budget-line muted" style="font-size:12px;margin-top:4px"><span>${monthLabel()}: spent ${money(totalSpent, bc)}</span><span>${leftLabel(totalSpent, db.budget.total, bc)}</span></div>` : ''}</div>
       <div class="section-title"><span>By category</span><span>${bc}</span></div><div class="list">`;
     for (const c of db.categories.filter(c => c.type === 'expense')) {
       const b = Number(db.budget.cats[c.id]) || 0, s = spent.get(c.id) || 0;
       html += `<div class="row"><span class="ico" style="background:${c.color}26">${c.icon}</span>
-        <span class="main"><span class="t">${esc(c.name)}</span><span class="sub">Spent ${money(s, bc)}</span>${b ? bar(s, b) : ''}</span>
+        <span class="main"><span class="t">${esc(c.name)}</span><span class="sub">${b ? `${leftLabel(s, b, bc)} · spent ${money(s, bc)}` : `Spent ${money(s, bc)}`}</span>${b ? bar(s, b) : ''}</span>
         <input class="budget-input" type="number" min="0" inputmode="decimal" placeholder="—" value="${b || ''}" data-change="budgetCat" data-id="${c.id}"></div>`;
     }
     return html + '</div>';
@@ -795,7 +820,8 @@ const actions = {
   ctype: el => { ui.ctype = el.dataset.type; render(); },
   catDetail: el => {
     const id = el.dataset.id || undefined;
-    const list = monthTx(ui.y, ui.m).filter(t => t.type === ui.rtype && t.categoryId === id);
+    const type = el.dataset.type || ui.rtype;
+    const list = monthTx(ui.y, ui.m).filter(t => t.type === type && t.categoryId === id);
     const c = catById(id);
     openSheet(`<div class="sheet-head"><button data-act="close">Close</button><h2>${c?.icon || ''} ${esc(c?.name || 'Uncategorized')}</h2><span style="min-width:60px"></span></div>
       <div class="muted" style="text-align:center">${monthLabel()} · ${money(sum(list, val))}</div>${txGroups(list)}`);
