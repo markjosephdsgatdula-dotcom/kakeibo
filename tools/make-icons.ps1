@@ -40,6 +40,29 @@ function New-Icon([int]$size, [string]$file, [bool]$maskable) {
   $g.Dispose(); $bmp.Dispose()
 }
 
+# Android notification badge: white silhouette on transparent (Android tints it).
+function New-Badge([int]$size, [string]$file) {
+  $bmp = New-Object System.Drawing.Bitmap $size, $size
+  $g = [System.Drawing.Graphics]::FromImage($bmp)
+  $g.SmoothingMode = 'AntiAlias'
+  $g.Clear([System.Drawing.Color]::Transparent)
+  $white = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::White)
+  $w = $size * 0.56; $h = $size * 0.7; $x = $size * 0.16; $y = $size * 0.18
+  $g.FillRectangle($white, [single]$x, [single]$y, [single]$w, [single]$h)
+  $g.CompositingMode = 'SourceCopy'
+  $clear = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::Transparent)
+  for ($i = 1; $i -le 3; $i++) {
+    $g.FillRectangle($clear, [single]($x + $w * 0.22), [single]($y + $h * (0.25 + 0.18 * $i)), [single]($w * 0.62), [single]($size * 0.05))
+  }
+  $c = $size * 0.36
+  $g.FillEllipse($clear, [single]($size * 0.56), [single]($size * 0.04), [single]($c + $size * 0.08), [single]($c + $size * 0.08))
+  $g.CompositingMode = 'SourceOver'
+  $g.FillEllipse($white, [single]($size * 0.6), [single]($size * 0.08), [single]$c, [single]$c)
+  $bmp.Save((Join-Path $out $file), [System.Drawing.Imaging.ImageFormat]::Png)
+  $g.Dispose(); $bmp.Dispose()
+}
+
+New-Badge 96 'badge-96.png'
 New-Icon 192 'icon-192.png' $false
 New-Icon 512 'icon-512.png' $false
 New-Icon 512 'icon-maskable-512.png' $true

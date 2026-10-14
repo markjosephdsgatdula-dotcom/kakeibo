@@ -353,7 +353,8 @@ function budgetCard(list) {
 function viewHome() {
   const list = monthTx(ui.y, ui.m);
   const { inc, exp, net } = totals(list);
-  let html = `<div class="card summary">
+  let html = typeof summaryBanner === 'function' ? summaryBanner() : '';
+  html += `<div class="card summary">
     <div><small>Income</small><b class="pos">${money(inc)}</b></div>
     <div><small>Expense</small><b class="neg">${money(exp)}</b></div>
     <div><small>Balance</small><b>${money(net)}</b></div></div>`;
@@ -414,6 +415,9 @@ function viewReport() {
   let html = `<div class="seg" style="margin-top:12px">
     <button data-act="rtype" data-type="expense" class="${type === 'expense' ? 'on' : ''}">Expense</button>
     <button data-act="rtype" data-type="income" class="${type === 'income' ? 'on' : ''}">Income</button></div>`;
+  if (typeof openSummary === 'function' && all.length) {
+    html += `<button class="btn secondary" data-act="openSummary" data-month="${ymKey(ui.y, ui.m)}">📋 ${esc(monthLabel())} summary</button>`;
+  }
 
   if (!total) {
     html += empty(`No ${type} this month`, '📊');
@@ -596,6 +600,7 @@ function render() {
   const views = { home: viewHome, calendar: viewCalendar, report: viewReport, more: viewMore };
   $('#view').innerHTML = views[ui.tab]();
   document.querySelectorAll('#tabbar [data-tab]').forEach(b => b.classList.toggle('on', b.dataset.tab === ui.tab));
+  if (typeof scheduleSummaryCache === 'function') scheduleSummaryCache();
 }
 
 function applyTheme() {

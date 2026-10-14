@@ -197,6 +197,13 @@ main { max-width: 640px; margin: 0 auto; padding: 0 16px 24px; }
 .scan-text { margin: 6px 4px 0; font-size: 13px; color: var(--muted); }
 .scan-text pre { white-space: pre-wrap; font-size: 12px; background: var(--card); border-radius: 8px; padding: 8px; max-height: 200px; overflow: auto; }
 input.filled { background: rgba(16,185,129,.12) !important; border-radius: 6px; }
+.summary-banner { display: flex; align-items: center; gap: 4px; padding: 10px 8px 10px 14px; border: 1px solid var(--accent); }
+.summary-open { flex: 1; display: flex; gap: 12px; align-items: center; border: 0; background: none; text-align: left; padding: 0; min-width: 0; }
+.summary-open > span:first-child { font-size: 26px; }
+.summary-open b, .summary-open small { display: block; }
+.summary-open small { color: var(--muted); font-size: 12px; }
+.summary-facts { display: flex; flex-direction: column; gap: 10px; font-size: 14px; }
+.summary-facts .bar { margin-top: 6px; }
 .sync-badge { border: 0; background: none; font-size: 17px; padding: 4px 2px; flex: none; line-height: 1; }
 .sync-badge.sync-syncing { animation: spin 1.2s linear infinite; }
 .sync-badge.sync-synced { opacity: .55; }
