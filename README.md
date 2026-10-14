@@ -13,7 +13,8 @@ No server and no account: data lives in the browser's local storage on each devi
 - **Budgets:** monthly total plus per-category limits
 - **Customizable categories:** icon, color, genres and order
 - **Backup:** export/restore JSON, export CSV for spreadsheets
-- **Settings:** currency (PHP by default), light/dark/auto theme, week start
+- **Multi-currency:** each account and entry has its own currency (PHP, JPY and USD by default). Totals convert into the display currency you pick (tap ₱/¥/$ in the top bar). Live exchange rates come from open.er-api.com, and you can also set rates by hand.
+- **Settings:** light/dark/auto theme, week start
 
 ## Run locally
 ```bash
