@@ -658,6 +658,7 @@ function renderTxSheet() {
   openSheet(`<div class="t-${d.type}">
     <div class="sheet-head"><button data-act="close">Cancel</button><h2>${d.id ? 'Edit entry' : 'New entry'}</h2><button data-act="saveTx">Save</button></div>
     <div class="seg">${['expense', 'income', 'transfer'].map(t => `<button data-act="txType" data-type="${t}" class="${d.type === t ? 'on' : ''}">${TYPE_LABEL[t]}</button>`).join('')}</div>
+    ${d.type === 'expense' && typeof scanSection === 'function' ? scanSection(d) : ''}
     <div class="amount-input">
       <button type="button" class="cur-chip" data-act="txCur" aria-label="Change entry currency">${esc(currencySymbol(d.currency))} ${d.currency}</button>
       <input id="f-amount" inputmode="decimal" placeholder="0" value="${esc(d.amount)}" autocomplete="off" aria-label="Amount" data-input="amount"></div>
@@ -682,6 +683,7 @@ function renderTxSheet() {
     ${d.id ? '<button class="btn secondary" data-act="dupTx">Duplicate as new</button><button class="btn danger" data-act="delTx">Delete</button>'
            : '<button class="btn secondary" data-act="saveTx" data-again="1">Save &amp; add another</button>'}
   </div>`);
+  if (typeof afterTxSheet === 'function') afterTxSheet(d);
 }
 
 // Accepts plain numbers or simple arithmetic like "120+35.5" (calculator-style entry).

@@ -5,6 +5,7 @@ No server and no account: data lives in the browser's local storage on each devi
 
 ## Features
 - **Entries:** expense / income / transfer, with categories, sub-genres, account, place (with autocomplete) and memo
+- **Receipt scanning** (📷 in the new-entry sheet): runs entirely on the device with Tesseract.js, in English or 日本語. It finds the total, date, store and currency, then guesses the category from the store name or from your past entries at the same place. The OCR engine downloads on first use and is cached for offline use. Photos are not stored or uploaded. The code is in `receipt.js`.
 - **Calculator-style amounts:** type `120+35` or `3*45`
 - **Home:** monthly income / expense / balance summary, budget progress and search
 - **Calendar:** daily totals per day; tap a day to see or add its entries
