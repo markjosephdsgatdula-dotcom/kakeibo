@@ -13,7 +13,7 @@ No server and no account: data lives in the browser's local storage on each devi
 - **Budgets:** monthly total plus per-category limits
 - **Customizable categories:** icon, color, genres and order
 - **Backup:** export/restore JSON, export CSV for spreadsheets
-- **Multi-currency:** each account and entry has its own currency (PHP, JPY and USD by default). Totals convert into the display currency you pick (tap ₱/¥/$ in the top bar). Live exchange rates come from open.er-api.com, and you can also set rates by hand.
+- **Multi-currency:** each account and entry has its own currency (PHP, JPY and USD by default). Totals convert into the display currency you pick (tap ₱/¥/$ in the top bar). Each entry locks the exchange rate for its own date: today's live rate (open.er-api.com) for new entries, or the historical ECB rate (frankfurter.dev) for past dates. You can override it per entry. Account balances and net worth use current rates.
 - **Settings:** light/dark/auto theme, week start
 
 ## Run locally

@@ -73,7 +73,11 @@ function migrate(raw) {
   if (!s.currencies.includes(s.currency)) s.currencies.unshift(s.currency);
   if (!raw.budget?.currency) data.budget.currency = s.currency;
   for (const a of data.accounts) a.currency ||= s.currency;
-  for (const t of data.transactions) t.currency ||= data.accounts.find(a => a.id === t.accountId)?.currency || s.currency;
+  for (const t of data.transactions) {
+    t.currency ||= data.accounts.find(a => a.id === t.accountId)?.currency || s.currency;
+    // Entries from before rate-locking: freeze at current rates now; lockHistoricalRates() refines to the entry's date.
+    t.fx ||= { rates: Object.fromEntries([...new Set([...s.currencies, 'USD'])].map(c => [c, data.fx.rates[c] || DEFAULT_RATES[c]])), date: '' };
+  }
   data.version = d.version;
   return data;
 }
@@ -101,12 +105,25 @@ const byNewest = (a, b) => b.date.localeCompare(a.date) || (b.created || 0) - (a
 /* ---------- currency ---------- */
 const disp = () => db.settings.currency; // currency all totals are shown in
 const txCur = t => t.currency || accById(t.accountId)?.currency || disp();
+const rate = c => db.fx.rates[c] || DEFAULT_RATES[c]; // current units per 1 USD
+// Converts at current rates — used for account values, budgets and previews.
 function conv(n, from, to = disp()) {
   if (from === to) return n;
-  const a = db.fx.rates[from] || DEFAULT_RATES[from], b = db.fx.rates[to] || DEFAULT_RATES[to];
+  const a = rate(from), b = rate(to);
   return a && b ? n / a * b : n;
 }
-const val = t => conv(t.amount, txCur(t)); // entry amount in the display currency
+// Converts an entry at the rates locked in when it was recorded (falls back to current for currencies added later).
+function txConv(t, to = disp(), n = t.amount) {
+  const from = txCur(t);
+  if (from === to) return n;
+  const r = t.fx?.rates || {};
+  const a = r[from] || rate(from), b = r[to] || rate(to);
+  return a && b ? n / a * b : n;
+}
+const val = t => txConv(t); // entry amount in the display currency
+const snapshot = () => Object.fromEntries([...new Set([...db.settings.currencies, 'USD'])].map(c => [c, rate(c)]));
+// Price of 1 unit of `cur` in the display currency, per a draft's locked rates (or today's).
+const draftRate = d => { const r = d.fx?.rates || {}; return (r[disp()] || rate(disp())) / (r[d.currency] || rate(d.currency)); };
 
 const fmts = new Map();
 function fmt(cur) {
@@ -146,6 +163,32 @@ async function refreshRates(manual) {
   if (manual) toast('Could not update rates — are you offline?');
 }
 
+// Replaces entry-time rates with the actual rate on each past entry's date (ECB data via frankfurter.dev,
+// using the last business day on or before the date). Manually set rates are never touched.
+let lockingRates = false;
+async function lockHistoricalRates() {
+  const td = today();
+  const pending = db.transactions.filter(t => t.date < td && t.fx?.date !== t.date && !t.fx?.manual);
+  if (!pending.length || !navigator.onLine || lockingRates) return;
+  lockingRates = true;
+  try {
+    const start = pending.reduce((m, t) => t.date < m ? t.date : m, td);
+    const syms = db.settings.currencies.filter(c => c !== 'USD').join(',');
+    const res = await fetch(`https://api.frankfurter.dev/v1/${start}..${td}?base=USD&symbols=${syms}`, { cache: 'no-store' });
+    if (!res.ok) return;
+    const series = (await res.json()).rates || {};
+    const days = Object.keys(series).sort();
+    for (const t of pending) {
+      let day = null;
+      for (const k of days) { if (k <= t.date) day = k; else break; }
+      if (!day) continue;
+      t.fx = { rates: { ...t.fx?.rates, USD: 1, ...series[day] }, date: t.date, source: `ECB ${day}` };
+    }
+    save(); render();
+  } catch { /* offline or API down — entries keep their entry-time rates and retry next launch */ }
+  finally { lockingRates = false; }
+}
+
 /* ---------- totals ---------- */
 function totals(list) {
   let inc = 0, exp = 0;
@@ -160,11 +203,11 @@ function accBalance(id) {
   let bal = a.opening || 0;
   for (const t of db.transactions) {
     if (t.accountId === id) {
-      const amt = conv(t.amount, txCur(t), a.currency);
+      const amt = txConv(t, a.currency);
       bal += t.type === 'income' ? amt : -amt;
     }
     if (t.type === 'transfer' && t.toAccountId === id) {
-      bal += t.toAmount != null ? conv(t.toAmount, t.toCurrency || a.currency, a.currency) : conv(t.amount, txCur(t), a.currency);
+      bal += t.toAmount != null ? conv(t.toAmount, t.toCurrency || a.currency, a.currency) : txConv(t, a.currency);
     }
   }
   return bal;
@@ -396,7 +439,7 @@ const SUBVIEWS = {
     const bc = db.budget.currency;
     const spent = new Map();
     const list = monthTx(ui.y, ui.m).filter(t => t.type === 'expense');
-    for (const t of list) spent.set(t.categoryId, (spent.get(t.categoryId) || 0) + conv(t.amount, txCur(t), bc));
+    for (const t of list) spent.set(t.categoryId, (spent.get(t.categoryId) || 0) + txConv(t, bc));
     const totalSpent = sum([...spent.values()]);
     let html = `<div class="form"><div class="field"><label>Budget in</label><select data-change="budgetCurrency">${curOptions(bc)}</select></div></div>
       <div class="card"><div class="budget-line"><b>Monthly total</b>
@@ -441,7 +484,8 @@ const SUBVIEWS = {
       html += `<div class="field"><label>1 ${c} =</label><input type="number" inputmode="decimal" step="any" min="0" value="${Number(r.toPrecision(6))}" data-change="rate" data-c="${c}"><span class="muted">${d}</span></div>`;
     }
     html += `</div>
-      <div class="muted" style="font-size:13px;padding:0 4px">Updated ${esc(updated)}${db.fx.updated ? ` · ${esc(db.fx.source)}` : ''}. Totals use current rates.</div>
+      <div class="muted" style="font-size:13px;padding:0 4px">Updated ${esc(updated)}${db.fx.updated ? ` · ${esc(db.fx.source)}` : ''}.
+        These rates apply to account balances, net worth and budgets. Each entry keeps the rate from its own date (open an entry to see or change it).</div>
       <div class="form"><div class="field"><label for="autoRates" style="flex:1;width:auto">Auto-update rates when online</label><input id="autoRates" type="checkbox" style="flex:none;width:22px;height:22px" ${s.autoRates ? 'checked' : ''} data-change="autoRates"></div></div>
       <button class="btn secondary" data-act="refreshRates">↻ Update rates now</button>`;
     return html;
@@ -513,10 +557,22 @@ const defaultDate = () => ymKey(ui.y, ui.m) === today().slice(0, 7) ? today() : 
 
 function readTxForm() {
   if (!draft) return;
-  for (const k of ['amount', 'date', 'place', 'note', 'accountId', 'toAccountId', 'toAmount']) {
+  for (const k of ['amount', 'date', 'place', 'note', 'accountId', 'toAccountId', 'toAmount', 'rate']) {
     const el = $('#f-' + k);
     if (el) draft[k] = el.value;
   }
+}
+
+const fmtRate = r => String(Number(r.toPrecision(6)));
+// Rate used for the live "≈" preview: whatever is typed in the rate field, else the draft's locked/current rate.
+const previewRate = () => Number($('#f-rate')?.value) || draftRate(draft);
+
+function rateNote(d) {
+  const fx = d.fx;
+  if (!d.id || !fx) return d.date < today() ? 'The rate for this date is looked up automatically when online.' : "Today's rate is locked in when you save.";
+  if (fx.manual) return 'Rate set manually.';
+  if (fx.date === d.date) return `Locked: ${fx.source ? fx.source.replace('ECB', 'ECB rate of') : 'rate on the day it was recorded'}.`;
+  return 'Locked at entry time; the rate for this date will be looked up when online.';
 }
 
 function renderTxSheet() {
@@ -527,7 +583,10 @@ function renderTxSheet() {
   const places = [...new Set(db.transactions.filter(t => t.place && t.type === d.type).sort(byNewest).map(t => t.place))].slice(0, 40);
   const toCur = accById(d.toAccountId)?.currency;
   const amt = parseAmount(d.amount);
-  const approx = d.currency !== disp() && amt > 0 ? `≈ ${money(conv(amt, d.currency))}` : '';
+  const foreign = d.currency !== disp();
+  const locked = fmtRate(draftRate(d));
+  const shownRate = d.rate ?? locked;
+  const approx = foreign && amt > 0 ? `≈ ${money(amt * (Number(shownRate) || draftRate(d)))}` : '';
 
   openSheet(`<div class="t-${d.type}">
     <div class="sheet-head"><button data-act="close">Cancel</button><h2>${d.id ? 'Edit entry' : 'New entry'}</h2><button data-act="saveTx">Save</button></div>
@@ -548,7 +607,10 @@ function renderTxSheet() {
            <div class="field"><label>${d.type === 'income' ? 'From' : 'Place'}</label><input id="f-place" list="places" value="${esc(d.place)}" placeholder="${d.type === 'income' ? 'Employer, client…' : 'Store, restaurant…'}" autocomplete="off"></div>
            <datalist id="places">${places.map(p => `<option value="${esc(p)}">`).join('')}</datalist>`}
       <div class="field"><label>Memo</label><input id="f-note" value="${esc(d.note)}" placeholder="Optional"></div>
+      ${foreign ? `<div class="field"><label>Rate</label><span class="muted" style="flex:none">1 ${d.currency} =</span>
+        <input id="f-rate" type="number" inputmode="decimal" step="any" min="0" value="${esc(shownRate)}" data-input="rate" data-locked="${locked}" style="text-align:right"><span class="muted" style="flex:none">${disp()}</span></div>` : ''}
     </div>
+    ${foreign ? `<div class="muted" style="font-size:12px;padding:0 4px">${esc(rateNote(d))} Change the rate to match what your card or exchange actually charged.</div>` : ''}
     <button class="btn" data-act="saveTx">Save</button>
     ${d.id ? '<button class="btn secondary" data-act="dupTx">Duplicate as new</button><button class="btn danger" data-act="delTx">Delete</button>'
            : '<button class="btn secondary" data-act="saveTx" data-again="1">Save &amp; add another</button>'}
@@ -570,13 +632,23 @@ function saveTx(again) {
   if (!(amount > 0) || !isFinite(amount)) { toast('Enter an amount'); $('#f-amount')?.focus(); return; }
   if (!/^\d{4}-\d{2}-\d{2}$/.test(d.date)) { toast('Pick a date'); return; }
   if (d.type === 'transfer' && d.accountId === d.toAccountId) { toast('Choose two different accounts'); return; }
-  const tx = { id: d.id || uid(), type: d.type, date: d.date, amount, currency: cur, accountId: d.accountId, note: d.note.trim(), created: d.created || Date.now() };
+  // Rate lock: keep the existing lock unless the date or currency changed; otherwise freeze today's rates.
+  const old = db.transactions.find(t => t.id === d.id);
+  let fx = old?.fx && old.date === d.date && txCur(old) === cur ? old.fx : { rates: snapshot(), date: today() };
+  const typed = Number(d.rate);
+  if (cur !== disp() && d.rate != null && d.rate !== fmtRate(draftRate(d)) && typed > 0) {
+    const rates = { ...fx.rates };
+    rates[disp()] ||= rate(disp());
+    rates[cur] = rates[disp()] / typed;
+    fx = { rates, date: d.date, manual: true };
+  }
+  const tx = { id: d.id || uid(), type: d.type, date: d.date, amount, currency: cur, fx, accountId: d.accountId, note: d.note.trim(), created: d.created || Date.now() };
   if (d.type === 'transfer') {
     tx.toAccountId = d.toAccountId;
     const toCur = accById(d.toAccountId)?.currency || cur;
     if (toCur !== cur) {
       const received = parseAmount(d.toAmount);
-      tx.toAmount = roundMoney(received > 0 ? received : conv(amount, cur, toCur), toCur);
+      tx.toAmount = roundMoney(received > 0 ? received : txConv(tx, toCur), toCur);
       tx.toCurrency = toCur;
     }
   } else Object.assign(tx, { categoryId: d.categoryId, genre: d.genre, place: d.place.trim() });
@@ -589,6 +661,7 @@ function saveTx(again) {
   ui.sel = tx.date;
   render();
   toast(i >= 0 ? 'Updated' : 'Saved');
+  if (tx.date < today() && !fx.manual && fx.date !== tx.date) lockHistoricalRates();
   if (again) {
     draft = { ...newDraft(tx.date), type: d.type, currency: cur, categoryId: d.categoryId, accountId: d.accountId, toAccountId: d.toAccountId };
     renderTxSheet();
@@ -661,7 +734,9 @@ function addSample() {
       });
     }
   }
+  for (const t of db.transactions) t.fx ||= { rates: snapshot(), date: '' };
   save(); toast('Sample data added');
+  lockHistoricalRates();
 }
 
 /* ---------- events ---------- */
@@ -703,12 +778,13 @@ const actions = {
     readTxForm();
     const list = [...new Set([...db.settings.currencies, draft.currency])];
     draft.currency = list[(list.indexOf(draft.currency) + 1) % list.length];
+    draft.rate = undefined;
     renderTxSheet();
   },
   txCat: el => { readTxForm(); if (draft.categoryId !== el.dataset.id) draft.genre = ''; draft.categoryId = el.dataset.id; renderTxSheet(); },
   txGenre: el => { readTxForm(); draft.genre = draft.genre === el.dataset.g ? '' : el.dataset.g; renderTxSheet(); },
   saveTx: el => saveTx(el.dataset.again),
-  dupTx: () => { readTxForm(); draft = { ...draft, id: null, created: null, date: today() }; renderTxSheet(); toast('Copied — edit and save'); },
+  dupTx: () => { readTxForm(); draft = { ...draft, id: null, created: null, fx: undefined, rate: undefined, date: today() }; renderTxSheet(); toast('Copied — edit and save'); },
   delTx: () => {
     if (!confirm('Delete this entry?')) return;
     db.transactions = db.transactions.filter(t => t.id !== draft.id);
@@ -822,7 +898,10 @@ const changes = {
   txAccount: el => {
     readTxForm();
     // The entry follows the currency of the account it's paid from.
-    if (el.id === 'f-accountId') draft.currency = accById(draft.accountId)?.currency || draft.currency;
+    if (el.id === 'f-accountId') {
+      const c = accById(draft.accountId)?.currency || draft.currency;
+      if (c !== draft.currency) { draft.currency = c; draft.rate = undefined; }
+    }
     renderTxSheet();
   },
   theme: el => { db.settings.theme = el.value; save(); applyTheme(); },
@@ -855,10 +934,10 @@ document.addEventListener('change', e => {
 document.addEventListener('input', e => {
   const k = e.target.dataset.input;
   if (k === 'q') { ui.q = e.target.value; $('#txlist').innerHTML = homeList(); }
-  if (k === 'amount' && draft) {
+  if ((k === 'amount' || k === 'rate') && draft) {
     // Live "≈ ₱…" preview when entering a foreign-currency amount.
-    const n = parseAmount(e.target.value);
-    $('#f-approx').textContent = draft.currency !== disp() && n > 0 ? `≈ ${money(conv(n, draft.currency))}` : '';
+    const n = parseAmount($('#f-amount').value);
+    $('#f-approx').textContent = draft.currency !== disp() && n > 0 ? `≈ ${money(n * previewRate())}` : '';
   }
 });
 document.addEventListener('keydown', e => {
@@ -881,3 +960,4 @@ if (new URLSearchParams(location.search).has('add')) {
   actions.newTx({ dataset: {} });
 }
 if (db.settings.autoRates && navigator.onLine && Date.now() - (db.fx.updated || 0) > 6 * 36e5) refreshRates(false);
+lockHistoricalRates();
