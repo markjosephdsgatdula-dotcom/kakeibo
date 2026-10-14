@@ -1,5 +1,5 @@
 // Bump VERSION whenever you deploy changes so clients pick up the new files.
-const VERSION = 'kakeibo-v1';
+const VERSION = 'kakeibo-v2';
 const ASSETS = [
   './',
   './index.html',

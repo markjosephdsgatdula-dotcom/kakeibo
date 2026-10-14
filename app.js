@@ -14,16 +14,25 @@ const sum = (arr, f = x => x) => arr.reduce((a, x) => a + f(x), 0);
 const TYPE_LABEL = { expense: 'Expense', income: 'Income', transfer: 'Transfer' };
 const TRANSFER_COLOR = '#8e7cc3';
 
+// Units per 1 USD. Offline fallback only — refreshed from the internet when online.
+const DEFAULT_RATES = {
+  USD: 1, PHP: 62.8, JPY: 158.3, EUR: 0.86, GBP: 0.75, AUD: 1.53, CAD: 1.39, SGD: 1.3, HKD: 7.78, KRW: 1420,
+  CNY: 7.12, INR: 88.5, IDR: 16500, MYR: 4.22, THB: 32.5, VND: 26300, AED: 3.67, SAR: 3.75, NZD: 1.74, CHF: 0.8,
+};
+const ALL_CURRENCIES = Object.keys(DEFAULT_RATES);
+
 /* ---------- data ---------- */
 function defaults() {
   const cat = (type, name, icon, color, genres = []) => ({ id: uid(), type, name, icon, color, genres });
   return {
-    version: 1,
-    settings: { currency: 'PHP', theme: 'auto', weekStart: 0 },
+    version: 2,
+    settings: { currency: 'PHP', currencies: ['PHP', 'JPY', 'USD'], theme: 'auto', weekStart: 0, autoRates: true },
     accounts: [
-      { id: uid(), name: 'Cash', icon: '👛', opening: 0 },
-      { id: uid(), name: 'Bank', icon: '🏦', opening: 0 },
-      { id: uid(), name: 'Credit card', icon: '💳', opening: 0 },
+      { id: uid(), name: 'Cash', icon: '👛', currency: 'PHP', opening: 0 },
+      { id: uid(), name: 'Bank', icon: '🏦', currency: 'PHP', opening: 0 },
+      { id: uid(), name: 'Credit card', icon: '💳', currency: 'PHP', opening: 0 },
+      { id: uid(), name: 'Yen wallet', icon: '💴', currency: 'JPY', opening: 0 },
+      { id: uid(), name: 'Dollar account', icon: '💵', currency: 'USD', opening: 0 },
     ],
     categories: [
       cat('expense', 'Food', '🍜', '#f59e0b', ['Groceries', 'Dining out', 'Cafe', 'Snacks', 'Delivery']),
@@ -45,17 +54,34 @@ function defaults() {
       cat('income', 'Other', '💰', '#64748b'),
     ],
     transactions: [],
-    budget: { total: 0, cats: {} },
+    budget: { total: 0, cats: {}, currency: 'PHP' },
+    fx: { rates: { ...DEFAULT_RATES }, updated: 0, source: 'built-in estimate' },
   };
+}
+
+// Fills in fields added in later versions so old saves and backups keep working.
+function migrate(raw) {
+  const d = defaults();
+  const data = {
+    ...d, ...raw,
+    settings: { ...d.settings, ...raw.settings },
+    budget: { ...d.budget, ...raw.budget },
+    fx: { ...d.fx, ...raw.fx, rates: { ...DEFAULT_RATES, ...raw.fx?.rates } },
+  };
+  const s = data.settings;
+  if (!Array.isArray(raw.settings?.currencies)) s.currencies = [s.currency];
+  if (!s.currencies.includes(s.currency)) s.currencies.unshift(s.currency);
+  if (!raw.budget?.currency) data.budget.currency = s.currency;
+  for (const a of data.accounts) a.currency ||= s.currency;
+  for (const t of data.transactions) t.currency ||= data.accounts.find(a => a.id === t.accountId)?.currency || s.currency;
+  data.version = d.version;
+  return data;
 }
 
 function load() {
   try {
     const raw = JSON.parse(localStorage.getItem(KEY));
-    if (raw && Array.isArray(raw.transactions)) {
-      const d = defaults();
-      return { ...d, ...raw, settings: { ...d.settings, ...raw.settings }, budget: { ...d.budget, ...raw.budget } };
-    }
+    if (raw && Array.isArray(raw.transactions)) return migrate(raw);
   } catch (e) { console.warn('Could not read saved data', e); }
   return defaults();
 }
@@ -72,43 +98,79 @@ const accName = id => accById(id)?.name ?? '—';
 const monthTx = (y, m) => db.transactions.filter(t => t.date.startsWith(ymKey(y, m)));
 const byNewest = (a, b) => b.date.localeCompare(a.date) || (b.created || 0) - (a.created || 0);
 
+/* ---------- currency ---------- */
+const disp = () => db.settings.currency; // currency all totals are shown in
+const txCur = t => t.currency || accById(t.accountId)?.currency || disp();
+function conv(n, from, to = disp()) {
+  if (from === to) return n;
+  const a = db.fx.rates[from] || DEFAULT_RATES[from], b = db.fx.rates[to] || DEFAULT_RATES[to];
+  return a && b ? n / a * b : n;
+}
+const val = t => conv(t.amount, txCur(t)); // entry amount in the display currency
+
+const fmts = new Map();
+function fmt(cur) {
+  if (!fmts.has(cur)) fmts.set(cur, new Intl.NumberFormat(undefined, { style: 'currency', currency: cur }));
+  return fmts.get(cur);
+}
+const money = (n, cur = disp()) => fmt(cur).format(n);
+function roundMoney(n, cur = disp()) {
+  const f = fmt(cur).resolvedOptions().maximumFractionDigits;
+  return Math.round(n * 10 ** f) / 10 ** f;
+}
+function currencySymbol(cur = disp()) {
+  try {
+    return new Intl.NumberFormat(undefined, { style: 'currency', currency: cur, currencyDisplay: 'narrowSymbol' })
+      .formatToParts(0).find(p => p.type === 'currency').value;
+  } catch { return cur; }
+}
+const compact = n => new Intl.NumberFormat(undefined, { notation: 'compact', maximumFractionDigits: 1 }).format(n);
+
+async function refreshRates(manual) {
+  const sources = [
+    ['open.er-api.com', 'https://open.er-api.com/v6/latest/USD', j => j.result === 'success' && j.rates],
+    ['frankfurter.dev', 'https://api.frankfurter.dev/v1/latest?base=USD', j => j.rates && { USD: 1, ...j.rates }],
+  ];
+  for (const [source, url, pick] of sources) {
+    try {
+      const res = await fetch(url, { cache: 'no-store' });
+      const rates = res.ok && pick(await res.json());
+      if (rates && db.settings.currencies.every(c => rates[c] || db.fx.rates[c])) {
+        db.fx = { rates: { ...db.fx.rates, ...rates }, updated: Date.now(), source };
+        save(); render();
+        if (manual) toast('Exchange rates updated');
+        return;
+      }
+    } catch { /* try next source */ }
+  }
+  if (manual) toast('Could not update rates — are you offline?');
+}
+
+/* ---------- totals ---------- */
 function totals(list) {
   let inc = 0, exp = 0;
-  for (const t of list) { if (t.type === 'income') inc += t.amount; else if (t.type === 'expense') exp += t.amount; }
+  for (const t of list) { if (t.type === 'income') inc += val(t); else if (t.type === 'expense') exp += val(t); }
   return { inc, exp, net: inc - exp };
 }
 
+// Balance in the account's own currency.
 function accBalance(id) {
-  let bal = accById(id)?.opening || 0;
+  const a = accById(id);
+  if (!a) return 0;
+  let bal = a.opening || 0;
   for (const t of db.transactions) {
-    if (t.type === 'income' && t.accountId === id) bal += t.amount;
-    if (t.type === 'expense' && t.accountId === id) bal -= t.amount;
-    if (t.type === 'transfer') {
-      if (t.accountId === id) bal -= t.amount;
-      if (t.toAccountId === id) bal += t.amount;
+    if (t.accountId === id) {
+      const amt = conv(t.amount, txCur(t), a.currency);
+      bal += t.type === 'income' ? amt : -amt;
+    }
+    if (t.type === 'transfer' && t.toAccountId === id) {
+      bal += t.toAmount != null ? conv(t.toAmount, t.toCurrency || a.currency, a.currency) : conv(t.amount, txCur(t), a.currency);
     }
   }
   return bal;
 }
 
 /* ---------- formatting ---------- */
-let nf, cf;
-function money(n) {
-  nf ||= new Intl.NumberFormat(undefined, { style: 'currency', currency: db.settings.currency });
-  return nf.format(n);
-}
-const compact = n => (cf ||= new Intl.NumberFormat(undefined, { notation: 'compact', maximumFractionDigits: 1 })).format(n);
-function currencySymbol() {
-  try {
-    return new Intl.NumberFormat(undefined, { style: 'currency', currency: db.settings.currency, currencyDisplay: 'narrowSymbol' })
-      .formatToParts(0).find(p => p.type === 'currency').value;
-  } catch { return db.settings.currency; }
-}
-function roundMoney(n) {
-  money(0);
-  const f = nf.resolvedOptions().maximumFractionDigits;
-  return Math.round(n * 10 ** f) / 10 ** f;
-}
 const dayLabel = s => parseD(s).toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' });
 const monthLabel = () => new Date(ui.y, ui.m, 1).toLocaleDateString(undefined, { year: 'numeric', month: 'long' });
 
@@ -134,19 +196,21 @@ function txRow(t) {
   if (t.type === 'transfer') {
     icon = '🔁'; color = TRANSFER_COLOR;
     title = `${accName(t.accountId)} → ${accName(t.toAccountId)}`;
-    sub = t.note || 'Transfer';
+    sub = [t.toAmount != null && `received ${money(t.toAmount, t.toCurrency)}`, t.note].filter(Boolean).join(' · ') || 'Transfer';
   } else {
     const c = catById(t.categoryId);
     icon = c?.icon || '❔'; color = c?.color || '#94a3b8';
     title = t.place || t.genre || c?.name || 'Uncategorized';
     sub = [c?.name, t.genre, accName(t.accountId), t.note].filter(Boolean).join(' · ');
   }
+  const cur = txCur(t);
   const cls = t.type === 'expense' ? 'neg' : t.type === 'income' ? 'pos' : 'muted';
   const sign = t.type === 'expense' ? '−' : t.type === 'income' ? '+' : '';
+  const approx = cur !== disp() ? `<small>≈ ${money(val(t))}</small>` : '';
   return `<button class="row" data-act="editTx" data-id="${t.id}">
     <span class="ico" style="background:${color}26">${icon}</span>
     <span class="main"><span class="t">${esc(title)}</span><span class="sub">${esc(sub)}</span></span>
-    <span class="amt ${cls}">${sign}${money(t.amount)}</span></button>`;
+    <span class="amt ${cls}">${sign}${money(t.amount, cur)}${approx}</span></button>`;
 }
 
 function txGroups(list) {
@@ -168,6 +232,7 @@ const bar = (used, limit) => {
   const pct = limit > 0 ? Math.min(100, used / limit * 100) : 0;
   return `<div class="bar ${used > limit ? 'over' : ''}"><i style="width:${pct}%"></i></div>`;
 };
+const budgetIn = v => conv(Number(v) || 0, db.budget.currency); // budget amount in display currency
 
 /* ---------- views ---------- */
 function viewHome() {
@@ -177,7 +242,7 @@ function viewHome() {
     <div><small>Income</small><b class="pos">${money(inc)}</b></div>
     <div><small>Expense</small><b class="neg">${money(exp)}</b></div>
     <div><small>Balance</small><b>${money(net)}</b></div></div>`;
-  const B = db.budget.total;
+  const B = budgetIn(db.budget.total);
   if (B > 0) {
     const left = B - exp;
     html += `<div class="card"><div class="budget-line"><span>Monthly budget</span>
@@ -192,7 +257,7 @@ function homeList(list = monthTx(ui.y, ui.m)) {
   const q = ui.q.trim().toLowerCase();
   const shown = q ? list.filter(t => {
     const c = catById(t.categoryId);
-    return [t.place, t.note, t.genre, c?.name, accName(t.accountId), String(t.amount)].join(' ').toLowerCase().includes(q);
+    return [t.place, t.note, t.genre, c?.name, accName(t.accountId), txCur(t), String(t.amount)].join(' ').toLowerCase().includes(q);
   }) : list;
   if (!shown.length) return q ? empty('No matches', '🔍') : empty('No entries this month', '🧾', 'Tap ＋ to record an expense.');
   return txGroups(shown);
@@ -207,7 +272,7 @@ function viewCalendar() {
   for (const t of db.transactions) {
     if (t.type === 'transfer') continue;
     const d = (map[t.date] ||= { inc: 0, exp: 0 });
-    if (t.type === 'income') d.inc += t.amount; else d.exp += t.amount;
+    if (t.type === 'income') d.inc += val(t); else d.exp += val(t);
   }
   const td = today();
   let html = '<div class="cal" style="margin-top:12px">';
@@ -232,9 +297,9 @@ function viewReport() {
   const type = ui.rtype;
   const all = monthTx(ui.y, ui.m);
   const list = all.filter(t => t.type === type);
-  const total = sum(list, t => t.amount);
+  const total = sum(list, val);
   const by = new Map();
-  for (const t of list) by.set(t.categoryId, (by.get(t.categoryId) || 0) + t.amount);
+  for (const t of list) by.set(t.categoryId, (by.get(t.categoryId) || 0) + val(t));
   const rows = [...by].map(([id, amt]) => ({ c: catById(id), id, amt })).sort((a, b) => b.amt - a.amt);
 
   let html = `<div class="seg" style="margin-top:12px">
@@ -261,7 +326,7 @@ function viewReport() {
     }
     html += '</div><div class="list">';
     for (const r of rows) {
-      const budget = type === 'expense' ? Number(db.budget.cats[r.id]) || 0 : 0;
+      const budget = type === 'expense' ? budgetIn(db.budget.cats[r.id]) : 0;
       html += `<button class="row" data-act="catDetail" data-id="${r.id ?? ''}">
         <span class="ico" style="background:${r.c?.color || '#94a3b8'}26">${r.c?.icon || '❔'}</span>
         <span class="main"><span class="t">${esc(r.c?.name || 'Uncategorized')}</span>
@@ -288,13 +353,13 @@ function viewReport() {
       <rect x="${cx + 1}" y="${base - he}" width="${bw}" height="${he}" rx="3" fill="var(--expense)"/>
       <text x="${cx}" y="${H - 6}" text-anchor="middle">${x.d.toLocaleDateString(undefined, { month: 'short' })}</text>`;
   });
-  html += `<div class="section-title"><span>Last 6 months</span></div>
+  html += `<div class="section-title"><span>Last 6 months</span><span>${disp()}</span></div>
     <div class="card bars"><svg viewBox="0 0 ${W} ${H}"><line x1="0" x2="${W}" y1="${base}" y2="${base}" stroke="var(--line)"/>${bars}</svg>
     <div class="legend"><span><i class="dot" style="background:var(--income)"></i> Income</span><span><i class="dot" style="background:var(--expense)"></i> Expense</span></div></div>`;
   return html;
 }
 
-const SUBS = { accounts: ['🏦', 'Accounts'], budget: ['🎯', 'Budget'], categories: ['🏷️', 'Categories'], data: ['💾', 'Backup & data'], settings: ['⚙️', 'Settings'] };
+const SUBS = { accounts: ['🏦', 'Accounts'], budget: ['🎯', 'Budget'], categories: ['🏷️', 'Categories'], currencies: ['💱', 'Currencies & rates'], data: ['💾', 'Backup & data'], settings: ['⚙️', 'Settings'] };
 
 function viewMore() {
   if (ui.sub) return SUBVIEWS[ui.sub]();
@@ -310,31 +375,38 @@ function viewMore() {
   return html;
 }
 
+const curOptions = (sel, list = db.settings.currencies) =>
+  [...new Set([...list, sel])].map(c => `<option value="${c}" ${c === sel ? 'selected' : ''}>${currencySymbol(c)} ${c}</option>`).join('');
+
 const SUBVIEWS = {
   accounts() {
-    const total = sum(db.accounts, a => accBalance(a.id));
-    let html = `<div class="card summary" style="grid-template-columns:1fr"><div><small>Net worth</small><b class="${total < 0 ? 'neg' : ''}" style="font-size:22px">${money(total)}</b></div></div><div class="list">`;
+    const total = sum(db.accounts, a => conv(accBalance(a.id), a.currency));
+    let html = `<div class="card summary" style="grid-template-columns:1fr"><div><small>Net worth (${disp()})</small><b class="${total < 0 ? 'neg' : ''}" style="font-size:22px">${money(total)}</b></div></div><div class="list">`;
     for (const a of db.accounts) {
       const b = accBalance(a.id);
+      const approx = a.currency !== disp() ? `<small>≈ ${money(conv(b, a.currency))}</small>` : '';
       html += `<button class="row" data-act="editAcc" data-id="${a.id}"><span class="ico" style="background:var(--chip)">${esc(a.icon)}</span>
-        <span class="main"><span class="t">${esc(a.name)}</span></span><span class="amt ${b < 0 ? 'neg' : ''}">${money(b)}</span></button>`;
+        <span class="main"><span class="t">${esc(a.name)}</span><span class="sub">${a.currency}</span></span>
+        <span class="amt ${b < 0 ? 'neg' : ''}">${money(b, a.currency)}${approx}</span></button>`;
     }
     return html + '</div><button class="btn secondary" data-act="editAcc">＋ Add account</button>';
   },
 
   budget() {
+    const bc = db.budget.currency;
     const spent = new Map();
     const list = monthTx(ui.y, ui.m).filter(t => t.type === 'expense');
-    for (const t of list) spent.set(t.categoryId, (spent.get(t.categoryId) || 0) + t.amount);
-    const totalSpent = sum(list, t => t.amount);
-    let html = `<div class="card"><div class="budget-line"><b>Monthly total</b>
+    for (const t of list) spent.set(t.categoryId, (spent.get(t.categoryId) || 0) + conv(t.amount, txCur(t), bc));
+    const totalSpent = sum([...spent.values()]);
+    let html = `<div class="form"><div class="field"><label>Budget in</label><select data-change="budgetCurrency">${curOptions(bc)}</select></div></div>
+      <div class="card"><div class="budget-line"><b>Monthly total</b>
       <input class="budget-input" type="number" min="0" inputmode="decimal" placeholder="None" value="${db.budget.total || ''}" data-change="budgetTotal"></div>
-      ${db.budget.total ? bar(totalSpent, db.budget.total) + `<div class="budget-line muted" style="font-size:12px;margin-top:4px"><span>${monthLabel()}: ${money(totalSpent)}</span><span>${money(db.budget.total)}</span></div>` : ''}</div>
-      <div class="section-title"><span>By category</span></div><div class="list">`;
+      ${db.budget.total ? bar(totalSpent, db.budget.total) + `<div class="budget-line muted" style="font-size:12px;margin-top:4px"><span>${monthLabel()}: ${money(totalSpent, bc)}</span><span>${money(db.budget.total, bc)}</span></div>` : ''}</div>
+      <div class="section-title"><span>By category</span><span>${bc}</span></div><div class="list">`;
     for (const c of db.categories.filter(c => c.type === 'expense')) {
       const b = Number(db.budget.cats[c.id]) || 0, s = spent.get(c.id) || 0;
       html += `<div class="row"><span class="ico" style="background:${c.color}26">${c.icon}</span>
-        <span class="main"><span class="t">${esc(c.name)}</span><span class="sub">Spent ${money(s)}</span>${b ? bar(s, b) : ''}</span>
+        <span class="main"><span class="t">${esc(c.name)}</span><span class="sub">Spent ${money(s, bc)}</span>${b ? bar(s, b) : ''}</span>
         <input class="budget-input" type="number" min="0" inputmode="decimal" placeholder="—" value="${b || ''}" data-change="budgetCat" data-id="${c.id}"></div>`;
     }
     return html + '</div>';
@@ -356,6 +428,25 @@ const SUBVIEWS = {
     return html + '</div><button class="btn secondary" data-act="editCat">＋ Add category</button>';
   },
 
+  currencies() {
+    const s = db.settings, d = disp();
+    const updated = db.fx.updated ? new Date(db.fx.updated).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' }) : 'never (using built-in estimates)';
+    let html = `<div class="form"><div class="field"><label>Show totals in</label><select data-change="currency">${curOptions(d)}</select></div></div>
+      <div class="muted" style="font-size:13px;padding:0 4px">You can also tap the currency button at the top of Home, Calendar and Report to switch.</div>
+      <div class="section-title"><span>My currencies</span></div>
+      <div class="chips">${ALL_CURRENCIES.map(c => `<button data-act="toggleCur" data-c="${c}" class="${s.currencies.includes(c) ? 'on' : ''}">${currencySymbol(c)} ${c}</button>`).join('')}</div>
+      <div class="section-title"><span>Exchange rates</span><span>in ${d}</span></div><div class="form">`;
+    for (const c of s.currencies.filter(c => c !== d)) {
+      const r = conv(1, c, d);
+      html += `<div class="field"><label>1 ${c} =</label><input type="number" inputmode="decimal" step="any" min="0" value="${Number(r.toPrecision(6))}" data-change="rate" data-c="${c}"><span class="muted">${d}</span></div>`;
+    }
+    html += `</div>
+      <div class="muted" style="font-size:13px;padding:0 4px">Updated ${esc(updated)}${db.fx.updated ? ` · ${esc(db.fx.source)}` : ''}. Totals use current rates.</div>
+      <div class="form"><div class="field"><label for="autoRates" style="flex:1;width:auto">Auto-update rates when online</label><input id="autoRates" type="checkbox" style="flex:none;width:22px;height:22px" ${s.autoRates ? 'checked' : ''} data-change="autoRates"></div></div>
+      <button class="btn secondary" data-act="refreshRates">↻ Update rates now</button>`;
+    return html;
+  },
+
   data() {
     const n = db.transactions.length;
     return `<div class="card muted">${n} entries · ${(new Blob([JSON.stringify(db)]).size / 1024).toFixed(1)} KB stored on this device</div>
@@ -368,10 +459,9 @@ const SUBVIEWS = {
   },
 
   settings() {
-    const cur = ['PHP', 'USD', 'JPY', 'EUR', 'GBP', 'AUD', 'CAD', 'SGD', 'HKD', 'KRW', 'CNY', 'INR', 'IDR', 'MYR', 'THB', 'VND', 'AED', 'SAR', 'NZD', 'CHF'];
     const s = db.settings;
     return `<div class="form">
-      <div class="field"><label>Currency</label><select data-change="currency">${cur.map(c => `<option ${c === s.currency ? 'selected' : ''}>${c}</option>`).join('')}</select></div>
+      <div class="field"><label>Currency</label><button class="row" style="padding:10px 0;border:0" data-act="sub" data-sub="currencies"><span class="main"><span class="t">${currencySymbol(s.currency)} ${s.currency}</span></span><span class="muted">›</span></button></div>
       <div class="field"><label>Theme</label><select data-change="theme">${['auto', 'light', 'dark'].map(t => `<option value="${t}" ${t === s.theme ? 'selected' : ''}>${t[0].toUpperCase() + t.slice(1)}</option>`).join('')}</select></div>
       <div class="field"><label>Week starts</label><select data-change="weekStart"><option value="0" ${+s.weekStart === 0 ? 'selected' : ''}>Sunday</option><option value="1" ${+s.weekStart === 1 ? 'selected' : ''}>Monday</option></select></div>
     </div>`;
@@ -386,9 +476,11 @@ function render() {
       ? `<button class="icon-btn ghost" data-act="back" aria-label="Back">‹</button><h1>${SUBS[ui.sub][1]}</h1><span style="width:36px"></span>`
       : '<h1>More</h1>';
   } else {
+    const curBtn = db.settings.currencies.length > 1
+      ? `<button class="cur-chip" data-act="cycleCur" aria-label="Change display currency">${esc(currencySymbol())} ${disp()}</button>` : '';
     top.innerHTML = `<button class="icon-btn" data-act="month" data-d="-1" aria-label="Previous month">‹</button>
       <h1 data-act="thisMonth">${monthLabel()}</h1>
-      <button class="icon-btn" data-act="month" data-d="1" aria-label="Next month">›</button>`;
+      <button class="icon-btn" data-act="month" data-d="1" aria-label="Next month">›</button>${curBtn}`;
   }
   const views = { home: viewHome, calendar: viewCalendar, report: viewReport, more: viewMore };
   $('#view').innerHTML = views[ui.tab]();
@@ -410,9 +502,10 @@ function setMonth(y, m) {
 /* ---------- transaction sheet ---------- */
 function newDraft(date) {
   const first = db.categories.find(c => c.type === 'expense');
+  const acc = db.accounts[0];
   return {
-    id: null, type: 'expense', date: date || defaultDate(), amount: '',
-    categoryId: first?.id, genre: '', accountId: db.accounts[0]?.id, toAccountId: db.accounts[1]?.id, place: '', note: '',
+    id: null, type: 'expense', date: date || defaultDate(), amount: '', currency: acc?.currency || disp(),
+    categoryId: first?.id, genre: '', accountId: acc?.id, toAccountId: db.accounts[1]?.id, toAmount: '', place: '', note: '',
   };
 }
 // New entries default to today, or the 1st of the viewed month if browsing another month.
@@ -420,7 +513,7 @@ const defaultDate = () => ymKey(ui.y, ui.m) === today().slice(0, 7) ? today() : 
 
 function readTxForm() {
   if (!draft) return;
-  for (const k of ['amount', 'date', 'place', 'note', 'accountId', 'toAccountId']) {
+  for (const k of ['amount', 'date', 'place', 'note', 'accountId', 'toAccountId', 'toAmount']) {
     const el = $('#f-' + k);
     if (el) draft[k] = el.value;
   }
@@ -430,22 +523,28 @@ function renderTxSheet() {
   const d = draft;
   const cats = db.categories.filter(c => c.type === d.type);
   const cat = catById(d.categoryId);
-  const accOpts = sel => db.accounts.map(a => `<option value="${a.id}" ${a.id === sel ? 'selected' : ''}>${esc(a.icon)} ${esc(a.name)}</option>`).join('');
+  const accOpts = sel => db.accounts.map(a => `<option value="${a.id}" ${a.id === sel ? 'selected' : ''}>${esc(a.icon)} ${esc(a.name)} (${a.currency})</option>`).join('');
   const places = [...new Set(db.transactions.filter(t => t.place && t.type === d.type).sort(byNewest).map(t => t.place))].slice(0, 40);
+  const toCur = accById(d.toAccountId)?.currency;
+  const amt = parseAmount(d.amount);
+  const approx = d.currency !== disp() && amt > 0 ? `≈ ${money(conv(amt, d.currency))}` : '';
 
   openSheet(`<div class="t-${d.type}">
     <div class="sheet-head"><button data-act="close">Cancel</button><h2>${d.id ? 'Edit entry' : 'New entry'}</h2><button data-act="saveTx">Save</button></div>
     <div class="seg">${['expense', 'income', 'transfer'].map(t => `<button data-act="txType" data-type="${t}" class="${d.type === t ? 'on' : ''}">${TYPE_LABEL[t]}</button>`).join('')}</div>
-    <div class="amount-input"><span>${esc(currencySymbol())}</span>
-      <input id="f-amount" inputmode="decimal" placeholder="0" value="${esc(d.amount)}" autocomplete="off" aria-label="Amount"></div>
+    <div class="amount-input">
+      <button type="button" class="cur-chip" data-act="txCur" aria-label="Change entry currency">${esc(currencySymbol(d.currency))} ${d.currency}</button>
+      <input id="f-amount" inputmode="decimal" placeholder="0" value="${esc(d.amount)}" autocomplete="off" aria-label="Amount" data-input="amount"></div>
+    <div class="approx muted" id="f-approx">${approx}</div>
     ${d.type !== 'transfer' ? `<div class="cats">${cats.map(c => `<button type="button" data-act="txCat" data-id="${c.id}" class="${c.id === d.categoryId ? 'on' : ''}"><i>${c.icon}</i>${esc(c.name)}</button>`).join('')}</div>
       ${cat?.genres.length ? `<div class="chips">${cat.genres.map(g => `<button type="button" data-act="txGenre" data-g="${esc(g)}" class="${g === d.genre ? 'on' : ''}">${esc(g)}</button>`).join('')}</div>` : ''}` : ''}
     <div class="form">
       <div class="field"><label>Date</label><input id="f-date" type="date" value="${d.date}" required></div>
       ${d.type === 'transfer'
-        ? `<div class="field"><label>From</label><select id="f-accountId">${accOpts(d.accountId)}</select></div>
-           <div class="field"><label>To</label><select id="f-toAccountId">${accOpts(d.toAccountId)}</select></div>`
-        : `<div class="field"><label>${d.type === 'income' ? 'Into' : 'Paid with'}</label><select id="f-accountId">${accOpts(d.accountId)}</select></div>
+        ? `<div class="field"><label>From</label><select id="f-accountId" data-change="txAccount">${accOpts(d.accountId)}</select></div>
+           <div class="field"><label>To</label><select id="f-toAccountId" data-change="txAccount">${accOpts(d.toAccountId)}</select></div>
+           ${toCur && toCur !== d.currency ? `<div class="field"><label>Received (${toCur})</label><input id="f-toAmount" inputmode="decimal" value="${esc(d.toAmount)}" placeholder="Auto: today's rate"></div>` : ''}`
+        : `<div class="field"><label>${d.type === 'income' ? 'Into' : 'Paid with'}</label><select id="f-accountId" data-change="txAccount">${accOpts(d.accountId)}</select></div>
            <div class="field"><label>${d.type === 'income' ? 'From' : 'Place'}</label><input id="f-place" list="places" value="${esc(d.place)}" placeholder="${d.type === 'income' ? 'Employer, client…' : 'Store, restaurant…'}" autocomplete="off"></div>
            <datalist id="places">${places.map(p => `<option value="${esc(p)}">`).join('')}</datalist>`}
       <div class="field"><label>Memo</label><input id="f-note" value="${esc(d.note)}" placeholder="Optional"></div>
@@ -466,13 +565,21 @@ function parseAmount(s) {
 function saveTx(again) {
   readTxForm();
   const d = draft;
-  const amount = roundMoney(parseAmount(d.amount));
+  const cur = d.currency || disp();
+  const amount = roundMoney(parseAmount(d.amount), cur);
   if (!(amount > 0) || !isFinite(amount)) { toast('Enter an amount'); $('#f-amount')?.focus(); return; }
   if (!/^\d{4}-\d{2}-\d{2}$/.test(d.date)) { toast('Pick a date'); return; }
   if (d.type === 'transfer' && d.accountId === d.toAccountId) { toast('Choose two different accounts'); return; }
-  const tx = { id: d.id || uid(), type: d.type, date: d.date, amount, accountId: d.accountId, note: d.note.trim(), created: d.created || Date.now() };
-  if (d.type === 'transfer') tx.toAccountId = d.toAccountId;
-  else Object.assign(tx, { categoryId: d.categoryId, genre: d.genre, place: d.place.trim() });
+  const tx = { id: d.id || uid(), type: d.type, date: d.date, amount, currency: cur, accountId: d.accountId, note: d.note.trim(), created: d.created || Date.now() };
+  if (d.type === 'transfer') {
+    tx.toAccountId = d.toAccountId;
+    const toCur = accById(d.toAccountId)?.currency || cur;
+    if (toCur !== cur) {
+      const received = parseAmount(d.toAmount);
+      tx.toAmount = roundMoney(received > 0 ? received : conv(amount, cur, toCur), toCur);
+      tx.toCurrency = toCur;
+    }
+  } else Object.assign(tx, { categoryId: d.categoryId, genre: d.genre, place: d.place.trim() });
 
   const i = db.transactions.findIndex(t => t.id === tx.id);
   if (i >= 0) db.transactions[i] = tx; else db.transactions.push(tx);
@@ -483,7 +590,7 @@ function saveTx(again) {
   render();
   toast(i >= 0 ? 'Updated' : 'Saved');
   if (again) {
-    draft = { ...newDraft(tx.date), type: d.type, categoryId: d.categoryId, accountId: d.accountId, toAccountId: d.toAccountId };
+    draft = { ...newDraft(tx.date), type: d.type, currency: cur, categoryId: d.categoryId, accountId: d.accountId, toAccountId: d.toAccountId };
     renderTxSheet();
     $('#f-amount').focus();
   } else closeSheet();
@@ -491,11 +598,12 @@ function saveTx(again) {
 
 /* ---------- account / category sheets ---------- */
 function accountSheet(a) {
-  a ||= { id: null, name: '', icon: '💳', opening: 0 };
+  a ||= { id: null, name: '', icon: '💳', currency: disp(), opening: 0 };
   openSheet(`<div class="sheet-head"><button data-act="close">Cancel</button><h2>${a.id ? 'Edit account' : 'New account'}</h2><button data-act="saveAcc" data-id="${a.id || ''}">Save</button></div>
     <div class="form">
       <div class="field"><label>Name</label><input id="a-name" value="${esc(a.name)}" placeholder="e.g. GCash, Savings"></div>
       <div class="field"><label>Icon</label><input id="a-icon" value="${esc(a.icon)}" maxlength="4"></div>
+      <div class="field"><label>Currency</label><select id="a-currency">${curOptions(a.currency)}</select></div>
       <div class="field"><label>Opening balance</label><input id="a-opening" type="number" inputmode="decimal" step="any" value="${a.opening || 0}"></div>
     </div>
     <div class="muted" style="font-size:13px;padding:0 4px">Use a negative opening balance for debts like credit cards.</div>
@@ -526,10 +634,10 @@ function download(name, text, type) {
 
 function toCsv() {
   const q = v => { const s = String(v ?? ''); return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s; };
-  const rows = [['Date', 'Type', 'Category', 'Genre', 'Account', 'To account', 'Amount', 'Place', 'Memo']];
+  const rows = [['Date', 'Type', 'Category', 'Genre', 'Account', 'To account', 'Amount', 'Currency', 'Received', 'Received currency', 'Place', 'Memo']];
   for (const t of [...db.transactions].sort((a, b) => a.date.localeCompare(b.date))) {
     rows.push([t.date, t.type, catById(t.categoryId)?.name ?? '', t.genre ?? '', accName(t.accountId),
-      t.type === 'transfer' ? accName(t.toAccountId) : '', t.amount, t.place ?? '', t.note ?? '']);
+      t.type === 'transfer' ? accName(t.toAccountId) : '', t.amount, txCur(t), t.toAmount ?? '', t.toCurrency ?? '', t.place ?? '', t.note ?? '']);
   }
   return '﻿' + rows.map(r => r.map(q).join(',')).join('\r\n');
 }
@@ -539,16 +647,17 @@ function addSample() {
   const pick = a => a[Math.floor(Math.random() * a.length)];
   const places = ['7-Eleven', 'SM Supermarket', 'Jollibee', 'Starbucks', 'Mercury Drug', 'Shopee', 'Grab', 'Puregold', 'Lazada', 'Market'];
   const salary = db.categories.find(c => c.type === 'income');
+  const pesoAcc = db.accounts.find(a => a.currency === 'PHP') || db.accounts[0];
   for (let mo = 0; mo < 3; mo++) {
     const base = new Date(now.getFullYear(), now.getMonth() - mo, 1);
     const days = mo === 0 ? now.getDate() : new Date(base.getFullYear(), base.getMonth() + 1, 0).getDate();
-    if (salary) db.transactions.push({ id: uid(), type: 'income', date: ymd(base), amount: 35000, categoryId: salary.id, genre: '', accountId: db.accounts[1]?.id, place: 'Employer', note: '', created: Date.now() });
+    if (salary) db.transactions.push({ id: uid(), type: 'income', date: ymd(base), amount: 35000, currency: pesoAcc.currency, categoryId: salary.id, genre: '', accountId: pesoAcc.id, place: 'Employer', note: '', created: Date.now() });
     for (let i = 0; i < days * 1.5; i++) {
-      const c = pick(exp);
+      const c = pick(exp), acc = pick(db.accounts);
       db.transactions.push({
         id: uid(), type: 'expense', date: ymd(new Date(base.getFullYear(), base.getMonth(), 1 + Math.floor(Math.random() * days))),
-        amount: roundMoney(50 + Math.random() * 900), categoryId: c.id, genre: c.genres.length ? pick(c.genres) : '',
-        accountId: pick(db.accounts).id, place: pick(places), note: '', created: Date.now(),
+        amount: roundMoney(conv(50 + Math.random() * 900, 'PHP', acc.currency), acc.currency), currency: acc.currency,
+        categoryId: c.id, genre: c.genres.length ? pick(c.genres) : '', accountId: acc.id, place: pick(places), note: '', created: Date.now(),
       });
     }
   }
@@ -560,6 +669,11 @@ const actions = {
   tab: el => { ui.tab = el.dataset.tab; ui.sub = null; render(); scrollTo(0, 0); },
   month: el => { setMonth(ui.y, ui.m + Number(el.dataset.d)); render(); },
   thisMonth: () => { setMonth(now.getFullYear(), now.getMonth()); render(); },
+  cycleCur: () => {
+    const list = db.settings.currencies;
+    db.settings.currency = list[(list.indexOf(disp()) + 1) % list.length];
+    save(); render(); toast(`Showing totals in ${disp()}`);
+  },
   pickDay: el => {
     ui.sel = el.dataset.d;
     const [y, m] = ui.sel.split('-').map(Number);
@@ -570,7 +684,8 @@ const actions = {
   editTx: el => {
     const t = db.transactions.find(x => x.id === el.dataset.id);
     if (!t) return;
-    draft = { genre: '', place: '', note: '', categoryId: null, toAccountId: db.accounts[1]?.id, ...t, amount: String(t.amount) };
+    draft = { genre: '', place: '', note: '', categoryId: null, toAccountId: db.accounts[1]?.id, ...t,
+      currency: txCur(t), amount: String(t.amount), toAmount: t.toAmount != null ? String(t.toAmount) : '' };
     renderTxSheet();
   },
   txType: el => {
@@ -582,6 +697,12 @@ const actions = {
     if (draft.type === 'transfer' && draft.toAccountId === draft.accountId) {
       draft.toAccountId = db.accounts.find(a => a.id !== draft.accountId)?.id;
     }
+    renderTxSheet();
+  },
+  txCur: () => {
+    readTxForm();
+    const list = [...new Set([...db.settings.currencies, draft.currency])];
+    draft.currency = list[(list.indexOf(draft.currency) + 1) % list.length];
     renderTxSheet();
   },
   txCat: el => { readTxForm(); if (draft.categoryId !== el.dataset.id) draft.genre = ''; draft.categoryId = el.dataset.id; renderTxSheet(); },
@@ -601,17 +722,31 @@ const actions = {
     const list = monthTx(ui.y, ui.m).filter(t => t.type === ui.rtype && t.categoryId === id);
     const c = catById(id);
     openSheet(`<div class="sheet-head"><button data-act="close">Close</button><h2>${c?.icon || ''} ${esc(c?.name || 'Uncategorized')}</h2><span style="min-width:60px"></span></div>
-      <div class="muted" style="text-align:center">${monthLabel()} · ${money(sum(list, t => t.amount))}</div>${txGroups(list)}`);
+      <div class="muted" style="text-align:center">${monthLabel()} · ${money(sum(list, val))}</div>${txGroups(list)}`);
   },
   sub: el => { ui.sub = el.dataset.sub; render(); scrollTo(0, 0); },
   back: () => { ui.sub = null; render(); },
   install: async () => { installPrompt?.prompt(); await installPrompt?.userChoice; installPrompt = null; render(); },
 
+  toggleCur: el => {
+    const c = el.dataset.c, list = db.settings.currencies;
+    if (list.includes(c)) {
+      if (list.length === 1) { toast('Keep at least one currency'); return; }
+      db.settings.currencies = list.filter(x => x !== c);
+      if (disp() === c) db.settings.currency = db.settings.currencies[0];
+    } else {
+      db.settings.currencies = ALL_CURRENCIES.filter(x => x === c || list.includes(x));
+    }
+    save(); render();
+  },
+  refreshRates: () => { toast('Updating rates…'); refreshRates(true); },
+
   editAcc: el => accountSheet(accById(el.dataset.id)),
   saveAcc: el => {
     const name = $('#a-name').value.trim();
     if (!name) { toast('Name required'); return; }
-    const a = { id: el.dataset.id || uid(), name, icon: $('#a-icon').value.trim() || '💳', opening: roundMoney(Number($('#a-opening').value) || 0) };
+    const currency = $('#a-currency').value;
+    const a = { id: el.dataset.id || uid(), name, icon: $('#a-icon').value.trim() || '💳', currency, opening: roundMoney(Number($('#a-opening').value) || 0, currency) };
     const i = db.accounts.findIndex(x => x.id === a.id);
     if (i >= 0) db.accounts[i] = a; else db.accounts.push(a);
     save(); closeSheet(); render();
@@ -662,7 +797,7 @@ const actions = {
   reset: () => {
     if (!confirm('Erase ALL entries, accounts and categories on this device?')) return;
     if (!confirm('This cannot be undone. Export a backup first if unsure. Erase now?')) return;
-    db = defaults(); nf = null; save(); applyTheme(); render(); toast('All data erased');
+    db = defaults(); save(); applyTheme(); render(); toast('All data erased');
   },
 };
 
@@ -673,7 +808,23 @@ const changes = {
     if (v) db.budget.cats[el.dataset.id] = v; else delete db.budget.cats[el.dataset.id];
     save(); render();
   },
-  currency: el => { db.settings.currency = el.value; nf = null; save(); toast('Currency updated'); },
+  budgetCurrency: el => { db.budget.currency = el.value; save(); render(); },
+  currency: el => { db.settings.currency = el.value; save(); render(); toast(`Showing totals in ${el.value}`); },
+  rate: el => {
+    const v = Number(el.value), c = el.dataset.c;
+    if (!(v > 0)) { render(); return; }
+    db.fx.rates[c] = db.fx.rates[disp()] / v;
+    db.fx.source = 'manual';
+    if (db.settings.autoRates) { db.settings.autoRates = false; toast('Rate saved — auto-update turned off'); }
+    save(); render();
+  },
+  autoRates: el => { db.settings.autoRates = el.checked; save(); if (el.checked) refreshRates(true); },
+  txAccount: el => {
+    readTxForm();
+    // The entry follows the currency of the account it's paid from.
+    if (el.id === 'f-accountId') draft.currency = accById(draft.accountId)?.currency || draft.currency;
+    renderTxSheet();
+  },
   theme: el => { db.settings.theme = el.value; save(); applyTheme(); },
   weekStart: el => { db.settings.weekStart = Number(el.value); save(); },
   importFile: async el => {
@@ -683,9 +834,8 @@ const changes = {
       const data = JSON.parse(await file.text());
       if (!Array.isArray(data.transactions) || !Array.isArray(data.categories) || !Array.isArray(data.accounts)) throw new Error('bad file');
       if (!confirm(`Replace current data with backup (${data.transactions.length} entries)?`)) return;
-      const d = defaults();
-      db = { ...d, ...data, settings: { ...d.settings, ...data.settings }, budget: { ...d.budget, ...data.budget } };
-      nf = null; save(); applyTheme(); render(); toast('Backup restored');
+      db = migrate(data);
+      save(); applyTheme(); render(); toast('Backup restored');
     } catch { toast('That file is not a valid backup'); }
     el.value = '';
   },
@@ -703,7 +853,13 @@ document.addEventListener('change', e => {
   if (el) changes[el.dataset.change]?.(el);
 });
 document.addEventListener('input', e => {
-  if (e.target.dataset.input === 'q') { ui.q = e.target.value; $('#txlist').innerHTML = homeList(); }
+  const k = e.target.dataset.input;
+  if (k === 'q') { ui.q = e.target.value; $('#txlist').innerHTML = homeList(); }
+  if (k === 'amount' && draft) {
+    // Live "≈ ₱…" preview when entering a foreign-currency amount.
+    const n = parseAmount(e.target.value);
+    $('#f-approx').textContent = draft.currency !== disp() && n > 0 ? `≈ ${money(conv(n, draft.currency))}` : '';
+  }
 });
 document.addEventListener('keydown', e => {
   if (e.key === 'Escape' && !$('#overlay').hidden) closeSheet();
@@ -724,3 +880,4 @@ if (new URLSearchParams(location.search).has('add')) {
   history.replaceState(null, '', location.pathname);
   actions.newTx({ dataset: {} });
 }
+if (db.settings.autoRates && navigator.onLine && Date.now() - (db.fx.updated || 0) > 6 * 36e5) refreshRates(false);

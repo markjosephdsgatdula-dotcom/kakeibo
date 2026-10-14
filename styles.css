@@ -179,4 +179,12 @@ main { max-width: 640px; margin: 0 auto; padding: 0 16px 24px; }
 }
 .toast[hidden] { display: none; }
 
+.cur-chip {
+  border: 1px solid var(--line); background: var(--card); border-radius: 99px; padding: 5px 10px;
+  font-size: 13px; font-weight: 600; white-space: nowrap; flex: none; box-shadow: var(--shadow);
+}
+.amount-input .cur-chip { font-size: 15px; box-shadow: none; background: var(--chip); }
+.approx { text-align: right; font-size: 13px; min-height: 18px; margin: -6px 6px 4px; }
+.row .amt small { display: block; text-align: right; font-size: 11px; font-weight: 400; color: var(--muted); }
+
 .budget-input { width: 110px; text-align: right; border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px; background: var(--bg); }
