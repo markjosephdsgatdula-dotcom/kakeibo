@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Kakeibo</title>
+  <meta name="description" content="Offline-first household expense tracker">
+  <meta name="theme-color" content="#10b981">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <meta name="apple-mobile-web-app-title" content="Kakeibo">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" type="image/png" href="icons/icon-192.png">
+  <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="topbar" id="topbar"></header>
+  <main id="view"></main>
+
+  <nav class="tabbar" id="tabbar">
+    <button data-act="tab" data-tab="home"><span>🏠</span>Home</button>
+    <button data-act="tab" data-tab="calendar"><span>📅</span>Calendar</button>
+    <button class="fab" data-act="newTx" aria-label="Add entry">＋</button>
+    <button data-act="tab" data-tab="report"><span>📊</span>Report</button>
+    <button data-act="tab" data-tab="more"><span>☰</span>More</button>
+  </nav>
+
+  <div class="overlay" id="overlay" hidden>
+    <div class="sheet" id="sheet" role="dialog" aria-modal="true"></div>
+  </div>
+  <div class="toast" id="toast" hidden></div>
+
+  <script src="app.js"></script>
+</body>
+</html>
