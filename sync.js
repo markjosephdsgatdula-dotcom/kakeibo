@@ -107,7 +107,7 @@ async function readGist(cfg) {
 /* ---------- merging ---------- */
 const syncPayload = d => ({
   version: d.version, settings: d.settings, budget: d.budget, fx: d.fx,
-  accounts: d.accounts, categories: d.categories, transactions: d.transactions, deleted: d.deleted,
+  accounts: d.accounts, categories: d.categories, transactions: d.transactions, recurring: d.recurring, deleted: d.deleted,
 });
 
 const newer = (a, b) => (!a ? b : !b ? a : (b.updated || 0) > (a.updated || 0) ? b : a);
@@ -130,6 +130,7 @@ function mergeDb(local, remote) {
     accounts: list(remote.accounts, local.accounts),
     categories: list(remote.categories, local.categories).sort((a, b) => (a.order ?? 0) - (b.order ?? 0)),
     transactions: list(remote.transactions, local.transactions),
+    recurring: list(remote.recurring, local.recurring),
     deleted,
   };
 }
@@ -152,7 +153,7 @@ function reconcile(local, remote) {
   };
   match('categories', (r, x) => r.type === x.type && norm(r.name) === norm(x.name));
   match('accounts', (r, x) => r.currency === x.currency && norm(r.name) === norm(x.name));
-  for (const t of local.transactions) {
+  for (const t of [...local.transactions, ...(local.recurring || []).map(r => r.template)]) {
     for (const k of ['categoryId', 'accountId', 'toAccountId']) if (remap[t[k]]) { t[k] = remap[t[k]]; t.updated = Date.now(); }
   }
   local.budget.cats = Object.fromEntries(Object.entries(local.budget.cats).map(([id, v]) => [remap[id] || id, v]));
@@ -202,6 +203,7 @@ async function syncNow(manual = false) {
     const before = JSON.stringify(syncPayload(db));
     if (JSON.stringify(syncPayload(merged)) !== before) {
       replaceDb(merged);
+      if (typeof runRecurring === 'function') runRecurring(); // rules from the other device may be due here too
       applyTheme(); render();
     }
 

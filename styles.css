@@ -204,6 +204,9 @@ input.filled { background: rgba(16,185,129,.12) !important; border-radius: 6px; 
 .summary-open small { color: var(--muted); font-size: 12px; }
 .summary-facts { display: flex; flex-direction: column; gap: 10px; font-size: 14px; }
 .summary-facts .bar { margin-top: 6px; }
+.link-btn { flex: 1; border: 0; background: none; color: var(--accent); padding: 10px 0; text-align: left; font-size: 14px; min-width: 0; }
+.upcoming { display: flex; flex-direction: column; gap: 8px; }
+.upcoming small { font-size: 12px; margin-left: 4px; }
 .sync-badge { border: 0; background: none; font-size: 17px; padding: 4px 2px; flex: none; line-height: 1; }
 .sync-badge.sync-syncing { animation: spin 1.2s linear infinite; }
 .sync-badge.sync-synced { opacity: .55; }

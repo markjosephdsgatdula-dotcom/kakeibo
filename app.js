@@ -56,6 +56,7 @@ function defaults() {
     ],
     transactions: [],
     budget: { total: 0, cats: {}, currency: 'PHP' },
+    recurring: [], // rules for repeating entries (rent, subscriptions…) — see recurring.js
     fx: { rates: { ...DEFAULT_RATES }, updated: 0, source: 'built-in estimate' },
     deleted: {}, // id -> time deleted, so deletions sync between devices
   };
@@ -83,6 +84,7 @@ function migrate(raw) {
   data.categories.forEach((c, i) => { c.order ??= i; });
   data.categories.sort((a, b) => a.order - b.order);
   data.deleted = { ...raw.deleted };
+  data.recurring = Array.isArray(raw.recurring) ? raw.recurring : [];
   data.version = d.version;
   return data;
 }
@@ -110,7 +112,7 @@ function snapshotDb(stamp) {
     if (stamp && baseline?.get(key) !== json) { obj.updated = now; changed = true; }
   };
   visit('settings', db.settings); visit('budget', db.budget); visit('fx', db.fx);
-  for (const coll of ['accounts', 'categories', 'transactions']) for (const r of db[coll]) visit(`${coll}:${r.id}`, r);
+  for (const coll of ['accounts', 'categories', 'transactions', 'recurring']) for (const r of db[coll]) visit(`${coll}:${r.id}`, r);
   if (stamp && baseline) {
     for (const key of baseline.keys()) {
       const id = key.split(':')[1];
@@ -287,6 +289,7 @@ function txRow(t) {
     title = t.place || t.genre || c?.name || 'Uncategorized';
     sub = [c?.name, t.genre, accName(t.accountId), t.note].filter(Boolean).join(' · ');
   }
+  if (t.recurringId) sub = `🔁 ${sub}`;
   const cur = txCur(t);
   const cls = t.type === 'expense' ? 'neg' : t.type === 'income' ? 'pos' : 'muted';
   const sign = t.type === 'expense' ? '−' : t.type === 'income' ? '+' : '';
@@ -359,6 +362,7 @@ function viewHome() {
     <div><small>Expense</small><b class="neg">${money(exp)}</b></div>
     <div><small>Balance</small><b>${money(net)}</b></div></div>`;
   html += budgetCard(list);
+  if (typeof upcomingCard === 'function') html += upcomingCard();
   html += `<input class="search" type="search" placeholder="Search this month…" value="${esc(ui.q)}" data-input="q">`;
   return html + `<div id="txlist">${homeList(list)}</div>`;
 }
@@ -472,7 +476,7 @@ function viewReport() {
   return html;
 }
 
-const SUBS = { sync: ['🔄', 'Sync devices'], accounts: ['🏦', 'Accounts'], budget: ['🎯', 'Budget'], categories: ['🏷️', 'Categories'], currencies: ['💱', 'Currencies & rates'], data: ['💾', 'Backup & data'], settings: ['⚙️', 'Settings'] };
+const SUBS = { sync: ['🔄', 'Sync devices'], accounts: ['🏦', 'Accounts'], recurring: ['🔁', 'Recurring'], budget: ['🎯', 'Budget'], categories: ['🏷️', 'Categories'], currencies: ['💱', 'Currencies & rates'], data: ['💾', 'Backup & data'], settings: ['⚙️', 'Settings'] };
 
 function viewMore() {
   if (ui.sub) return SUBVIEWS[ui.sub]();
@@ -629,7 +633,7 @@ const defaultDate = () => ymKey(ui.y, ui.m) === today().slice(0, 7) ? today() : 
 
 function readTxForm() {
   if (!draft) return;
-  for (const k of ['amount', 'date', 'place', 'note', 'accountId', 'toAccountId', 'toAmount', 'rate']) {
+  for (const k of ['amount', 'date', 'place', 'note', 'accountId', 'toAccountId', 'toAmount', 'rate', 'repeat']) {
     const el = $('#f-' + k);
     if (el) draft[k] = el.value;
   }
@@ -680,6 +684,7 @@ function renderTxSheet() {
            <div class="field"><label>${d.type === 'income' ? 'From' : 'Place'}</label><input id="f-place" list="places" value="${esc(d.place)}" placeholder="${d.type === 'income' ? 'Employer, client…' : 'Store, restaurant…'}" autocomplete="off"></div>
            <datalist id="places">${places.map(p => `<option value="${esc(p)}">`).join('')}</datalist>`}
       <div class="field"><label>Memo</label><input id="f-note" value="${esc(d.note)}" placeholder="Optional"></div>
+      ${typeof repeatField === 'function' ? repeatField(d) : ''}
       ${foreign ? `<div class="field"><label>Rate</label><span class="muted" style="flex:none">1 ${d.currency} =</span>
         <input id="f-rate" type="number" inputmode="decimal" step="any" min="0" value="${esc(shownRate)}" data-input="rate" data-locked="${locked}" style="text-align:right"><span class="muted" style="flex:none">${disp()}</span></div>` : ''}
     </div>
@@ -726,10 +731,13 @@ function saveTx(again) {
       tx.toCurrency = toCur;
     }
   } else Object.assign(tx, { categoryId: d.categoryId, genre: d.genre, place: d.place.trim() });
+  if (d.recurringId) tx.recurringId = d.recurringId;
+  if (typeof beforeSaveTx === 'function') beforeSaveTx(d, tx); // may turn a new entry into a recurring series
 
   const i = db.transactions.findIndex(t => t.id === tx.id);
   if (i >= 0) db.transactions[i] = tx; else db.transactions.push(tx);
   save();
+  if (i < 0 && tx.recurringId && typeof runRecurring === 'function') runRecurring();
   const [y, m] = tx.date.split('-').map(Number);
   if (y !== ui.y || m - 1 !== ui.m) { ui.y = y; ui.m = m - 1; }
   ui.sel = tx.date;
@@ -858,7 +866,7 @@ const actions = {
   txCat: el => { readTxForm(); if (draft.categoryId !== el.dataset.id) draft.genre = ''; draft.categoryId = el.dataset.id; renderTxSheet(); },
   txGenre: el => { readTxForm(); draft.genre = draft.genre === el.dataset.g ? '' : el.dataset.g; renderTxSheet(); },
   saveTx: el => saveTx(el.dataset.again),
-  dupTx: () => { readTxForm(); draft = { ...draft, id: null, created: null, fx: undefined, rate: undefined, date: today() }; renderTxSheet(); toast('Copied — edit and save'); },
+  dupTx: () => { readTxForm(); draft = { ...draft, id: null, created: null, fx: undefined, rate: undefined, recurringId: undefined, date: today() }; renderTxSheet(); toast('Copied — edit and save'); },
   delTx: () => {
     if (!confirm('Delete this entry?')) return;
     db.transactions = db.transactions.filter(t => t.id !== draft.id);
