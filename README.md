@@ -14,6 +14,7 @@ No server and no account: data lives in the browser's local storage on each devi
 - **Customizable categories:** icon, color, genres and order
 - **Backup:** export/restore JSON, export CSV for spreadsheets
 - **Multi-currency:** each account and entry has its own currency (PHP, JPY and USD by default). Totals convert into the display currency you pick (tap ₱/¥/$ in the top bar). Each entry locks the exchange rate for its own date: today's live rate (open.er-api.com) for new entries, or the historical ECB rate (frankfurter.dev) for past dates. You can override it per entry. Account balances and net worth use current rates.
+- **Sync between devices** (More → Sync devices): data is encrypted on the device (AES-GCM, with a key derived from your passphrase) and stored in a secret gist in your own GitHub account. It's offline-first: changes queue while you're offline and sync when you reconnect or reopen the app. Changes merge entry by entry, and the newest edit wins. The token and passphrase stay in that device's storage only. The code is in `sync.js`.
 - **Settings:** light/dark/auto theme, week start
 
 ## Run locally

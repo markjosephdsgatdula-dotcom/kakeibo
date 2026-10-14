@@ -1,10 +1,11 @@
 // Bump VERSION whenever you deploy changes so clients pick up the new files.
-const VERSION = 'kakeibo-v4';
+const VERSION = 'kakeibo-v5';
 const ASSETS = [
   './',
   './index.html',
   './styles.css',
   './app.js',
+  './sync.js',
   './manifest.webmanifest',
   './icons/icon-192.png',
   './icons/icon-512.png',

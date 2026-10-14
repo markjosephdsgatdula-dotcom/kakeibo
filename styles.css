@@ -187,6 +187,10 @@ main { max-width: 640px; margin: 0 auto; padding: 0 16px 24px; }
   border: 1px solid var(--line); background: var(--card); border-radius: 99px; padding: 5px 10px;
   font-size: 13px; font-weight: 600; white-space: nowrap; flex: none; box-shadow: var(--shadow);
 }
+.sync-badge { border: 0; background: none; font-size: 17px; padding: 4px 2px; flex: none; line-height: 1; }
+.sync-badge.sync-syncing { animation: spin 1.2s linear infinite; }
+.sync-badge.sync-synced { opacity: .55; }
+@keyframes spin { to { transform: rotate(360deg); } }
 .amount-input .cur-chip { font-size: 15px; box-shadow: none; background: var(--chip); }
 .approx { text-align: right; font-size: 13px; min-height: 18px; margin: -6px 6px 4px; }
 .row .amt small { display: block; text-align: right; font-size: 11px; font-weight: 400; color: var(--muted); }

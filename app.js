@@ -23,9 +23,10 @@ const ALL_CURRENCIES = Object.keys(DEFAULT_RATES);
 
 /* ---------- data ---------- */
 function defaults() {
-  const cat = (type, name, icon, color, genres = []) => ({ id: uid(), type, name, icon, color, genres });
+  let order = 0;
+  const cat = (type, name, icon, color, genres = []) => ({ id: uid(), type, name, icon, color, genres, order: order++ });
   return {
-    version: 2,
+    version: 3,
     settings: { currency: 'PHP', currencies: ['PHP', 'JPY', 'USD'], theme: 'auto', weekStart: 0, autoRates: true },
     accounts: [
       { id: uid(), name: 'Cash', icon: '👛', currency: 'PHP', opening: 0 },
@@ -56,6 +57,7 @@ function defaults() {
     transactions: [],
     budget: { total: 0, cats: {}, currency: 'PHP' },
     fx: { rates: { ...DEFAULT_RATES }, updated: 0, source: 'built-in estimate' },
+    deleted: {}, // id -> time deleted, so deletions sync between devices
   };
 }
 
@@ -78,6 +80,9 @@ function migrate(raw) {
     // Entries from before rate-locking: freeze at current rates now; lockHistoricalRates() refines to the entry's date.
     t.fx ||= { rates: Object.fromEntries([...new Set([...s.currencies, 'USD'])].map(c => [c, data.fx.rates[c] || DEFAULT_RATES[c]])), date: '' };
   }
+  data.categories.forEach((c, i) => { c.order ??= i; });
+  data.categories.sort((a, b) => a.order - b.order);
+  data.deleted = { ...raw.deleted };
   data.version = d.version;
   return data;
 }
@@ -91,9 +96,45 @@ function load() {
 }
 
 let db = load();
+
+// Change tracking for sync: compares every record with how it looked at the last save, stamps
+// `updated` on anything that changed and records deletions. No call site has to remember to do it.
+let baseline = null;
+function snapshotDb(stamp) {
+  const now = Date.now(), snap = new Map();
+  let changed = false;
+  const visit = (key, obj) => {
+    const { updated, ...rest } = obj;
+    const json = JSON.stringify(rest);
+    snap.set(key, json);
+    if (stamp && baseline?.get(key) !== json) { obj.updated = now; changed = true; }
+  };
+  visit('settings', db.settings); visit('budget', db.budget); visit('fx', db.fx);
+  for (const coll of ['accounts', 'categories', 'transactions']) for (const r of db[coll]) visit(`${coll}:${r.id}`, r);
+  if (stamp && baseline) {
+    for (const key of baseline.keys()) {
+      const id = key.split(':')[1];
+      if (id && !snap.has(key)) { db.deleted[id] = now; changed = true; }
+    }
+  }
+  baseline = snap;
+  return changed;
+}
+snapshotDb(false);
+
+function writeLocal() {
+  try { localStorage.setItem(KEY, JSON.stringify(db)); return true; }
+  catch (e) { toast('⚠️ Could not save — storage may be full'); return false; }
+}
 function save() {
-  try { localStorage.setItem(KEY, JSON.stringify(db)); }
-  catch (e) { toast('⚠️ Could not save — storage may be full'); }
+  const changed = snapshotDb(true);
+  if (writeLocal() && changed && typeof onLocalChange === 'function') onLocalChange();
+}
+// Used when data arrives from sync: store it without treating it as a local edit.
+function replaceDb(next) {
+  db = next;
+  snapshotDb(false);
+  writeLocal();
 }
 
 const catById = id => db.categories.find(c => c.id === id);
@@ -427,13 +468,14 @@ function viewReport() {
   return html;
 }
 
-const SUBS = { accounts: ['🏦', 'Accounts'], budget: ['🎯', 'Budget'], categories: ['🏷️', 'Categories'], currencies: ['💱', 'Currencies & rates'], data: ['💾', 'Backup & data'], settings: ['⚙️', 'Settings'] };
+const SUBS = { sync: ['🔄', 'Sync devices'], accounts: ['🏦', 'Accounts'], budget: ['🎯', 'Budget'], categories: ['🏷️', 'Categories'], currencies: ['💱', 'Currencies & rates'], data: ['💾', 'Backup & data'], settings: ['⚙️', 'Settings'] };
 
 function viewMore() {
   if (ui.sub) return SUBVIEWS[ui.sub]();
   let html = '<div class="list" style="margin-top:12px">';
   for (const [k, [icon, name]] of Object.entries(SUBS)) {
-    html += `<button class="row" data-act="sub" data-sub="${k}"><span class="ico" style="background:var(--chip)">${icon}</span><span class="main"><span class="t">${name}</span></span><span class="muted">›</span></button>`;
+    const sub = k === 'sync' && typeof syncSummary === 'function' ? `<span class="sub">${esc(syncSummary())}</span>` : '';
+    html += `<button class="row" data-act="sub" data-sub="${k}"><span class="ico" style="background:var(--chip)">${icon}</span><span class="main"><span class="t">${name}</span>${sub}</span><span class="muted">›</span></button>`;
   }
   html += '</div>';
   const standalone = matchMedia('(display-mode: standalone)').matches || navigator.standalone;
@@ -549,7 +591,7 @@ function render() {
       ? `<button class="cur-chip" data-act="cycleCur" aria-label="Change display currency">${esc(currencySymbol())} ${disp()}</button>` : '';
     top.innerHTML = `<button class="icon-btn" data-act="month" data-d="-1" aria-label="Previous month">‹</button>
       <h1 data-act="thisMonth">${monthLabel()}</h1>
-      <button class="icon-btn" data-act="month" data-d="1" aria-label="Next month">›</button>${curBtn}`;
+      <button class="icon-btn" data-act="month" data-d="1" aria-label="Next month">›</button>${curBtn}${typeof syncBadge === 'function' ? syncBadge() : ''}`;
   }
   const views = { home: viewHome, calendar: viewCalendar, report: viewReport, more: viewMore };
   $('#view').innerHTML = views[ui.tab]();
@@ -870,6 +912,7 @@ const actions = {
     const c = {
       id: old?.id || uid(), type: old?.type || ui.ctype, name, icon: $('#c-icon').value.trim() || '🏷️', color: $('#c-color').value,
       genres: $('#c-genres').value.split(/[\n,]/).map(s => s.trim()).filter(Boolean),
+      order: old?.order ?? Math.max(-1, ...db.categories.map(x => x.order ?? 0)) + 1,
     };
     if (old) Object.assign(old, c); else db.categories.push(c);
     save(); closeSheet(); render();
@@ -887,8 +930,10 @@ const actions = {
     const same = db.categories.filter(x => x.type === c.type);
     const j = same.indexOf(c) + Number(el.dataset.d);
     if (j < 0 || j >= same.length) return;
-    const a = db.categories.indexOf(c), b = db.categories.indexOf(same[j]);
-    [db.categories[a], db.categories[b]] = [db.categories[b], db.categories[a]];
+    // Order lives in each category's `order` field (not array position) so reordering syncs.
+    same.forEach((x, i) => { x.order = i; });
+    [c.order, same[j].order] = [same[j].order, c.order];
+    db.categories.sort((p, q) => p.order - q.order);
     save(); render();
   },
 
@@ -899,7 +944,9 @@ const actions = {
   reset: () => {
     if (!confirm('Erase ALL entries, accounts and categories on this device?')) return;
     if (!confirm('This cannot be undone. Export a backup first if unsure. Erase now?')) return;
-    db = defaults(); save(); applyTheme(); render(); toast('All data erased');
+    // Disconnect sync first and don't record deletions, so erasing this device never wipes your other devices.
+    if (typeof disconnectSync === 'function') disconnectSync();
+    replaceDb(defaults()); applyTheme(); render(); toast('All data on this device erased');
   },
 };
 
@@ -938,7 +985,8 @@ const changes = {
     try {
       const data = JSON.parse(await file.text());
       if (!Array.isArray(data.transactions) || !Array.isArray(data.categories) || !Array.isArray(data.accounts)) throw new Error('bad file');
-      if (!confirm(`Replace current data with backup (${data.transactions.length} entries)?`)) return;
+      const synced = typeof syncConfig === 'function' && syncConfig();
+      if (!confirm(`Replace current data with backup (${data.transactions.length} entries)?${synced ? '\n\nSync is on, so your other devices will be replaced with this backup too.' : ''}`)) return;
       db = migrate(data);
       save(); applyTheme(); render(); toast('Backup restored');
     } catch { toast('That file is not a valid backup'); }
