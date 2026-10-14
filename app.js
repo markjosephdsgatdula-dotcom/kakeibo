@@ -779,6 +779,58 @@ function categorySheet(c) {
     ${c.id ? `<button class="btn danger" data-act="delCat" data-id="${c.id}">Delete category</button>` : ''}`);
 }
 
+/* ---------- deleting an account or category that's in use ---------- */
+const refKeys = kind => (kind === 'account' ? ['accountId', 'toAccountId'] : ['categoryId']);
+function usageOf(kind, id) {
+  const uses = o => refKeys(kind).some(k => o?.[k] === id);
+  return { entries: db.transactions.filter(uses), rules: (db.recurring || []).filter(r => uses(r.template)) };
+}
+
+// Entries and recurring series that use the item can be moved elsewhere. Series must be moved, or every
+// future rent/subscription entry would be created without an account or category.
+function deleteSheet(kind, id) {
+  const isAcc = kind === 'account';
+  const item = isAcc ? accById(id) : catById(id);
+  if (!item) return;
+  const { entries, rules } = usageOf(kind, id);
+  if (!entries.length && !rules.length) {
+    if (confirm(`Delete "${item.name}"?`)) finishDelete(kind, id, null);
+    return;
+  }
+  const others = isAcc ? db.accounts.filter(a => a.id !== id) : db.categories.filter(c => c.type === item.type && c.id !== id);
+  if (!others.length) { toast(`Add another ${item.type} category first, so its entries have somewhere to go`); return; }
+  const seriesNames = rules.map(r => (typeof ruleName === 'function' ? ruleName(r) : 'recurring entry'));
+  const used = [
+    entries.length && `<b>${entries.length}</b> ${entries.length === 1 ? 'entry' : 'entries'}`,
+    rules.length && `<b>${rules.length}</b> recurring series (${esc(seriesNames.join(', '))})`,
+  ].filter(Boolean).join(' and ');
+  const label = o => `${esc(o.icon)} ${esc(o.name)}${isAcc ? ` (${o.currency})` : ''}`;
+  const keepOption = rules.length ? '' : `<option value="">Don't move — show as ${isAcc ? '"—"' : '"Uncategorized"'}</option>`;
+  openSheet(`<div class="sheet-head"><button data-act="close">Cancel</button><h2>Delete ${isAcc ? 'account' : 'category'}</h2><span style="min-width:60px"></span></div>
+    <div class="card">${label(item)} is used by ${used}.</div>
+    <div class="form"><div class="field"><label>Move them to</label><select id="del-target">${others.map(o => `<option value="${o.id}">${label(o)}</option>`).join('')}${keepOption}</select></div></div>
+    <div class="muted" style="font-size:13px;padding:0 4px">${[
+      rules.length && 'Recurring series have to move so future entries still have ' + (isAcc ? 'an account.' : 'a category.'),
+      isAcc && "Moved entries keep their own currency and count toward the new account's balance.",
+    ].filter(Boolean).join(' ')}</div>
+    <button class="btn btn-danger" data-act="confirmDelete" data-kind="${kind}" data-id="${id}">Delete "${esc(item.name)}"</button>`);
+}
+
+function finishDelete(kind, id, target) {
+  const isAcc = kind === 'account';
+  const item = isAcc ? accById(id) : catById(id);
+  if (target) {
+    for (const o of [...db.transactions, ...(db.recurring || []).map(r => r.template)]) {
+      for (const k of refKeys(kind)) if (o[k] === id) o[k] = target;
+    }
+  }
+  if (isAcc) db.accounts = db.accounts.filter(a => a.id !== id);
+  else { db.categories = db.categories.filter(c => c.id !== id); delete db.budget.cats[id]; }
+  save(); closeSheet(); render();
+  const to = target && (isAcc ? accById(target) : catById(target));
+  toast(`Deleted "${item?.name}"${to ? ` — moved to ${to.name}` : ''}`);
+}
+
 /* ---------- import / export ---------- */
 function download(name, text, type) {
   const url = URL.createObjectURL(new Blob([text], { type }));
@@ -911,13 +963,10 @@ const actions = {
     save(); closeSheet(); render();
   },
   delAcc: el => {
-    const id = el.dataset.id;
-    const used = db.transactions.filter(t => t.accountId === id || t.toAccountId === id).length;
     if (db.accounts.length <= 1) { toast('Keep at least one account'); return; }
-    if (!confirm(used ? `${used} entries use this account. They will be kept but show "—" as account. Delete?` : 'Delete this account?')) return;
-    db.accounts = db.accounts.filter(a => a.id !== id);
-    save(); closeSheet(); render();
+    deleteSheet('account', el.dataset.id);
   },
+  confirmDelete: el => finishDelete(el.dataset.kind, el.dataset.id, $('#del-target')?.value || null),
 
   editCat: el => categorySheet(catById(el.dataset.id)),
   saveCat: el => {
@@ -932,14 +981,7 @@ const actions = {
     if (old) Object.assign(old, c); else db.categories.push(c);
     save(); closeSheet(); render();
   },
-  delCat: el => {
-    const id = el.dataset.id;
-    const used = db.transactions.filter(t => t.categoryId === id).length;
-    if (!confirm(used ? `${used} entries use this category. They will show as "Uncategorized". Delete?` : 'Delete this category?')) return;
-    db.categories = db.categories.filter(c => c.id !== id);
-    delete db.budget.cats[id];
-    save(); closeSheet(); render();
-  },
+  delCat: el => deleteSheet('category', el.dataset.id),
   moveCat: el => {
     const c = catById(el.dataset.id);
     const same = db.categories.filter(x => x.type === c.type);
@@ -1037,8 +1079,27 @@ document.addEventListener('keydown', e => {
 /* ---------- PWA ---------- */
 addEventListener('beforeinstallprompt', e => { e.preventDefault(); installPrompt = e; if (ui.tab === 'more' && !ui.sub) render(); });
 if ('serviceWorker' in navigator && location.protocol !== 'file:') {
-  navigator.serviceWorker.register('sw.js').catch(err => console.warn('SW registration failed', err));
+  // When a new version installs (sw.js changed), offer a one-tap refresh instead of waiting for the next launch.
+  // Skipped on the very first install, when there was no previous version to replace.
+  const hadController = !!navigator.serviceWorker.controller;
+  navigator.serviceWorker.addEventListener('controllerchange', () => { if (hadController) showUpdateBar(); });
+  navigator.serviceWorker.register('sw.js').then(reg => {
+    // Look for updates when the app comes back to the foreground, and every 30 minutes while it's open.
+    const check = () => reg.update().catch(() => {});
+    document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') check(); });
+    setInterval(check, 30 * 60 * 1000);
+  }).catch(err => console.warn('SW registration failed', err));
 }
+function showUpdateBar() {
+  if ($('#update-bar')) return;
+  const bar = Object.assign(document.createElement('div'), { id: 'update-bar', className: 'update-bar' });
+  bar.innerHTML = '<span>✨ A new version of Kakeibo is ready</span><button data-act="applyUpdate">Refresh</button>';
+  document.body.append(bar);
+}
+actions.applyUpdate = () => {
+  if (draft && !confirm('Refresh now? The entry you are editing will be discarded.')) return;
+  location.reload();
+};
 navigator.storage?.persist?.();
 
 applyTheme();

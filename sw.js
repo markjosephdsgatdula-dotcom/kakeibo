@@ -1,5 +1,5 @@
 // Bump VERSION whenever you deploy changes so clients pick up the new files.
-const VERSION = 'kakeibo-v8';
+const VERSION = 'kakeibo-v9';
 // Version-pinned third-party files (the receipt reader). Kept across app updates; they never change.
 const CDN_CACHE = 'kakeibo-cdn-v1';
 const ASSETS = [
@@ -20,7 +20,10 @@ const ASSETS = [
 ];
 
 self.addEventListener('install', e => {
-  e.waitUntil(caches.open(VERSION).then(c => c.addAll(ASSETS)).then(() => self.skipWaiting()));
+  // cache: 'reload' skips the browser's HTTP cache, so a new version never precaches a stale file.
+  e.waitUntil(caches.open(VERSION)
+    .then(c => c.addAll(ASSETS.map(url => new Request(url, { cache: 'reload' }))))
+    .then(() => self.skipWaiting()));
 });
 
 self.addEventListener('activate', e => {
