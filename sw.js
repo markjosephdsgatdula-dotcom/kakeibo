@@ -1,5 +1,5 @@
 // Bump VERSION whenever you deploy changes so clients pick up the new files.
-const VERSION = 'kakeibo-v10';
+const VERSION = 'kakeibo-v11';
 // Version-pinned third-party files (the receipt reader). Kept across app updates; they never change.
 const CDN_CACHE = 'kakeibo-cdn-v1';
 const ASSETS = [
@@ -117,17 +117,18 @@ self.addEventListener('fetch', e => {
     }));
     return;
   }
-  if (url.origin !== location.origin) return;
+  // ?fresh=… bypasses the cache (tests.html uses it to always test the latest code).
+  if (url.origin !== location.origin || url.searchParams.has('fresh')) return;
 
   // App files — stale-while-revalidate: answer from cache instantly (works offline), refresh in the background.
+  // A page that isn't cached comes from the network; the app's main page is only a fallback when offline.
   e.respondWith(
     caches.open(VERSION).then(async cache => {
-      const cached = await cache.match(req, { ignoreSearch: true }) ||
-        (req.mode === 'navigate' ? await cache.match('./index.html') : undefined);
-      const network = fetch(req)
-        .then(res => { if (res.ok) cache.put(req, res.clone()); return res; })
-        .catch(() => cached);
-      return cached || network;
+      const cached = await cache.match(req, { ignoreSearch: true });
+      const network = fetch(req).then(res => { if (res.ok) cache.put(req, res.clone()); return res; });
+      if (cached) { network.catch(() => {}); return cached; }
+      return network.catch(async () =>
+        (req.mode === 'navigate' && await cache.match('./index.html')) || Response.error());
     })
   );
 });

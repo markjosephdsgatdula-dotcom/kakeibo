@@ -27,6 +27,10 @@ python -m http.server 8765
 ```
 Open http://localhost:8765. Service workers don't run from `file://`.
 
+## Tests
+Open `tests.html` while the local server is running: http://localhost:8765/tests.html. It runs 46 tests covering money and currency, rate locking, balances, sync merging and encryption (including a two-device run), recurring dates, deletes, receipt parsing, budgets and the monthly summary, the getting-started guide, migrations and backups.
+The tests run against an in-memory copy with a fixed clock and fake exchange-rate and GitHub servers, so real data is never touched. **Run them before every deploy; all must pass.**
+
 ## Deploy (GitHub Pages)
 Push to a GitHub repo, then go to **Settings → Pages → Deploy from a branch → `main` / root**.
 The site appears at `https://<user>.github.io/<repo>/`.

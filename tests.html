@@ -1,0 +1,598 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Kakeibo tests</title>
+  <style>
+    :root { --bg: #fff; --text: #1f2933; --muted: #6b7785; --pass: #0a7d4f; --fail: #c62828; --line: #e4e7eb; color-scheme: light; }
+    @media (prefers-color-scheme: dark) { :root { --bg: #0f1216; --text: #e6e9ed; --muted: #95a0ad; --pass: #4ade80; --fail: #ff6b6f; --line: #2a3139; color-scheme: dark; } }
+    body { margin: 0; padding: 16px; background: var(--bg); color: var(--text); font: 14px/1.5 system-ui, sans-serif; max-width: 760px; }
+    h1 { font-size: 20px; margin: 0 0 4px; }
+    .note { color: var(--muted); margin: 0 0 12px; }
+    #summary { font-size: 17px; font-weight: 700; margin: 12px 0; }
+    .group { margin-top: 14px; font-weight: 700; border-bottom: 1px solid var(--line); padding-bottom: 2px; }
+    .t { padding: 2px 0; }
+    .pass::before { content: '✓ '; color: var(--pass); font-weight: 700; }
+    .fail { color: var(--fail); }
+    .fail::before { content: '✗ '; font-weight: 700; }
+    pre { white-space: pre-wrap; margin: 2px 0 6px 18px; font-size: 12px; color: var(--fail); }
+    button { font: inherit; padding: 6px 14px; border-radius: 8px; border: 1px solid var(--line); background: none; color: inherit; cursor: pointer; }
+  </style>
+</head>
+<body>
+  <h1>Kakeibo tests</h1>
+  <p class="note">Runs the app against a throwaway in-memory copy with a fixed clock and fake exchange-rate / GitHub servers. Your real data is never read or changed.</p>
+  <button onclick="location.reload()">Run again</button>
+  <div id="summary">Loading…</div>
+  <div id="results"></div>
+
+  <!-- The app's page skeleton, hidden: the code under test renders into it. -->
+  <div id="app-under-test" hidden>
+    <header id="topbar"></header><main id="view"></main>
+    <nav id="tabbar"><button data-tab="home"></button><button data-tab="calendar"></button><button data-tab="report"></button><button data-tab="more"></button></nav>
+    <div id="overlay" hidden><div id="sheet"></div></div><div id="toast" hidden></div>
+  </div>
+
+<script>
+'use strict';
+/* ---------- isolation: never touch the real app data ---------- */
+class MemoryStorage {
+  constructor() { this.m = new Map(); }
+  getItem(k) { return this.m.has(k) ? this.m.get(k) : null; }
+  setItem(k, v) { this.m.set(k, String(v)); }
+  removeItem(k) { this.m.delete(k); }
+  clear() { this.m.clear(); }
+  key(i) { return [...this.m.keys()][i] ?? null; }
+  get length() { return this.m.size; }
+}
+const mem = new MemoryStorage();
+try { Object.defineProperty(window, 'localStorage', { configurable: true, get: () => mem }); } catch { /* checked below */ }
+const ISOLATED = window.localStorage === mem;
+
+// Fixed clock: 15 Oct 2026, 10:00. tick() moves it forward; setClock() jumps.
+const RealDate = Date;
+let FAKE_NOW = new RealDate(2026, 9, 15, 10).getTime();
+window.Date = class extends RealDate {
+  constructor(...a) { if (a.length) super(...a); else super(FAKE_NOW); }
+  static now() { return FAKE_NOW; }
+};
+const setClock = (y, m, d, h = 10) => { FAKE_NOW = new RealDate(y, m, d, h).getTime(); };
+const tick = (ms = 1) => { FAKE_NOW += ms; };
+
+// Fake servers: exchange rates (1 USD = 60 PHP = 150 JPY), historical ECB rates, and a GitHub gist store.
+const TEST_RATES = { USD: 1, PHP: 60, JPY: 150, EUR: 0.9, GBP: 0.8, AUD: 1.5, CAD: 1.4, SGD: 1.3, HKD: 7.8, KRW: 1400, CNY: 7, INR: 85, IDR: 16000, MYR: 4.2, THB: 33, VND: 26000, AED: 3.67, SAR: 3.75, NZD: 1.7, CHF: 0.8 };
+const ECB = { '2026-09-03': { PHP: 54, JPY: 139 }, '2026-09-04': { PHP: 55, JPY: 140 }, '2026-09-07': { PHP: 56, JPY: 141 }, '2026-10-14': { PHP: 60, JPY: 150 } };
+const gists = {};
+let ONLINE = true;
+const ghCalls = [];
+Object.defineProperty(navigator, 'onLine', { configurable: true, get: () => ONLINE });
+const json = (o, status = 200) => new Response(JSON.stringify(o), { status, headers: { 'Content-Type': 'application/json' } });
+const realFetch = window.fetch;
+window.fetch = async (url, opts = {}) => {
+  const u = new URL(String(url), location.href);
+  if (u.hostname === 'open.er-api.com') return json({ result: 'success', rates: TEST_RATES });
+  if (u.hostname === 'api.frankfurter.dev') {
+    const end = u.pathname.split('..')[1] || '9999';
+    return json({ base: 'USD', rates: Object.fromEntries(Object.entries(ECB).filter(([d]) => d <= end)) });
+  }
+  if (u.hostname === 'api.github.com') {
+    const m = opts.method || 'GET';
+    ghCalls.push(`${m} ${u.pathname}`);
+    if (opts.headers?.Authorization !== 'Bearer test-token') return json({ message: 'Bad credentials' }, 401);
+    if (u.pathname === '/gists' && m === 'GET') return json(Object.values(gists).map(g => ({ id: g.id, files: Object.fromEntries(Object.keys(g.files).map(k => [k, { filename: k }])) })));
+    if (u.pathname === '/gists' && m === 'POST') {
+      const b = JSON.parse(opts.body), id = 'g' + Math.random().toString(36).slice(2, 8);
+      gists[id] = { id, public: b.public, files: Object.fromEntries(Object.entries(b.files).map(([k, v]) => [k, { content: v.content, truncated: false }])) };
+      return json(gists[id], 201);
+    }
+    const g = gists[u.pathname.split('/')[2]];
+    if (!g) return json({}, 404);
+    if (m === 'GET') return json(g);
+    if (m === 'PATCH') { for (const [k, v] of Object.entries(JSON.parse(opts.body).files)) g.files[k] = { content: v.content, truncated: false }; return json(g); }
+  }
+  if (u.origin !== location.origin) return json({ error: 'blocked in tests' }, 503); // no real network calls
+  return realFetch(url, opts);
+};
+// Don't install the app's service worker or show real notifications from the test page.
+if (navigator.serviceWorker) navigator.serviceWorker.register = () => Promise.resolve({ update: () => Promise.resolve() });
+window.confirm = () => true;
+
+/* ---------- tiny test runner ---------- */
+const TESTS = [];
+const test = (group, name, fn) => TESTS.push({ group, name, fn });
+const show = v => (typeof v === 'string' ? JSON.stringify(v) : JSON.stringify(v));
+function eq(actual, expected, msg = '') { if (JSON.stringify(actual) !== JSON.stringify(expected)) throw new Error(`${msg ? msg + ': ' : ''}expected ${show(expected)}, got ${show(actual)}`); }
+function ok(cond, msg = 'expected true') { if (!cond) throw new Error(msg); }
+function near(actual, expected, msg = '', eps = 0.005) { if (!(Math.abs(actual - expected) <= eps)) throw new Error(`${msg ? msg + ': ' : ''}expected ≈${expected}, got ${actual}`); }
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+async function waitFor(cond, ms = 15000) { const t0 = performance.now(); while (!cond()) { if (performance.now() - t0 > ms) throw new Error('timed out waiting'); await sleep(20); } }
+
+/* ---------- helpers for driving the app ---------- */
+let toasts = [];
+const cat = (name, type = 'expense') => db.categories.find(c => c.name === name && c.type === type);
+const acc = name => db.accounts.find(a => a.name === name);
+const byPlace = place => db.transactions.filter(t => t.place === place);
+// Adds an entry through the real entry form (renderTxSheet + saveTx), like a user would.
+function addTx(p = {}) {
+  tick();
+  const before = new Set(db.transactions.map(t => t.id));
+  const d = { ...newDraft(p.date || today()), ...p, amount: String(p.amount ?? 100) };
+  if (p.accountId && !p.currency) d.currency = accById(p.accountId).currency;
+  if (p.type && p.type !== 'expense' && !p.categoryId && p.type !== 'transfer') d.categoryId = db.categories.find(c => c.type === p.type).id;
+  draft = d;
+  renderTxSheet();
+  saveTx();
+  return db.transactions.filter(t => !before.has(t.id))[0];
+}
+const rowWith = (sel, text) => [...document.querySelectorAll(sel)].find(e => e.textContent.includes(text));
+const devices = {};
+let currentDevice = 'A';
+function switchDevice(name) {
+  clearTimeout(syncState.timer);
+  devices[currentDevice] = { data: mem.getItem('kakeibo.v1'), cfg: mem.getItem('kakeibo.sync') };
+  currentDevice = name;
+  const d = devices[name] || {};
+  d.data != null ? mem.setItem('kakeibo.v1', d.data) : mem.removeItem('kakeibo.v1');
+  d.cfg != null ? mem.setItem('kakeibo.sync', d.cfg) : mem.removeItem('kakeibo.sync');
+  syncState.error = '';
+  replaceDb(load());
+}
+async function connectSync(pass) {
+  ui.tab = 'more'; ui.sub = 'sync'; render();
+  $('#s-token').value = 'test-token'; $('#s-pass').value = pass;
+  await actions.syncConnect();
+  clearTimeout(syncState.timer);
+}
+
+async function resetApp() {
+  await waitFor(() => !lockingRates && !syncState.running);
+  clearTimeout(syncState.timer); syncState.again = false; syncState.error = '';
+  setClock(2026, 9, 15);
+  mem.clear();
+  for (const k of Object.keys(devices)) delete devices[k];
+  for (const k of Object.keys(gists)) delete gists[k];
+  currentDevice = 'A'; ONLINE = true; ghCalls.length = 0; toasts = [];
+  closeSheet(); draft = null; ruleDraft = null; balDraft = null;
+  const fresh = defaults();
+  fresh.fx = { rates: { ...TEST_RATES }, updated: Date.now(), source: 'test' };
+  replaceDb(fresh);
+  Object.assign(ui, { tab: 'home', sub: null, q: '', rtype: 'expense', ctype: 'expense', guideOpen: null });
+  setMonth(2026, 9);
+}
+
+/* ===================================================================== */
+/*                                TESTS                                  */
+/* ===================================================================== */
+
+/* ---------- money & currency ---------- */
+test('Money & currency', 'calculator-style amounts, and no code execution', () => {
+  eq(parseAmount('1,200'), 1200);
+  eq(parseAmount('120+30'), 150);
+  eq(parseAmount('3*45.5'), 136.5);
+  ok(isNaN(parseAmount('alert(1)')), 'letters must be rejected');
+  ok(isNaN(parseAmount('')), 'empty is not a number');
+});
+test('Money & currency', 'rounding follows the currency (yen has no decimals)', () => {
+  eq(roundMoney(123.456, 'PHP'), 123.46);
+  eq(roundMoney(123.6, 'JPY'), 124);
+});
+test('Money & currency', 'conversion uses current rates', () => {
+  near(conv(150, 'JPY', 'PHP'), 60);
+  near(conv(1, 'USD', 'JPY'), 150);
+  eq(conv(5, 'PHP', 'PHP'), 5);
+});
+test('Money & currency', 'totals convert to the display currency, and switching it works', () => {
+  addTx({ amount: 100 });
+  addTx({ amount: 1500, accountId: acc('Yen wallet').id });
+  near(totals(monthTx(2026, 9)).exp, 700, 'PHP total (100 + ¥1500 → ₱600)');
+  actions.cycleCur();
+  eq(disp(), 'JPY');
+  near(totals(monthTx(2026, 9)).exp, 1750, 'JPY total');
+});
+
+/* ---------- rate locking ---------- */
+test('Exchange-rate locking', "an entry keeps today's rate when rates move later", () => {
+  const t = addTx({ amount: 1000, accountId: acc('Yen wallet').id });
+  near(val(t), 400);
+  db.fx.rates.JPY = 100;
+  near(val(t), 400, 'locked entry value');
+  near(conv(1000, 'JPY'), 600, 'current-rate conversion moved');
+});
+test('Exchange-rate locking', 'editing the memo keeps the lock; changing the date re-locks', async () => {
+  const t = addTx({ amount: 1000, accountId: acc('Yen wallet').id });
+  const lock = JSON.stringify(t.fx);
+  db.fx.rates.JPY = 100;
+  actions.editTx({ dataset: { id: t.id } }); $('#f-note').value = 'lunch'; saveTx();
+  eq(JSON.stringify(db.transactions.find(x => x.id === t.id).fx), lock, 'memo edit');
+  actions.editTx({ dataset: { id: t.id } }); $('#f-date').value = '2026-10-10'; saveTx();
+  await waitFor(() => !lockingRates); await lockHistoricalRates();
+  eq(db.transactions.find(x => x.id === t.id).fx.source, 'ECB 2026-09-07', 'date change → rate for that date (last business day on/before)');
+});
+test('Exchange-rate locking', 'a Saturday entry gets Friday\'s ECB rate', async () => {
+  const t = addTx({ amount: 1000, accountId: acc('Yen wallet').id, date: '2026-09-05' });
+  await waitFor(() => !lockingRates); await lockHistoricalRates();
+  const saved = db.transactions.find(x => x.id === t.id);
+  eq(saved.fx.source, 'ECB 2026-09-04');
+  near(val(saved), 1000 / 140 * 55);
+});
+test('Exchange-rate locking', 'a manually typed rate is never overwritten', async () => {
+  const t = addTx({ amount: 1000, accountId: acc('Yen wallet').id, date: '2026-09-05' });
+  await waitFor(() => !lockingRates);
+  actions.editTx({ dataset: { id: t.id } }); $('#f-rate').value = '0.5'; saveTx();
+  ok(db.transactions.find(x => x.id === t.id).fx.manual, 'marked manual');
+  await waitFor(() => !lockingRates); await lockHistoricalRates();
+  near(val(db.transactions.find(x => x.id === t.id)), 500);
+});
+
+/* ---------- balances ---------- */
+test('Account balances', 'expenses, income and transfers', () => {
+  acc('Cash').opening = 1000;
+  addTx({ amount: 200, accountId: acc('Cash').id });
+  addTx({ type: 'income', amount: 500, accountId: acc('Bank').id });
+  addTx({ type: 'transfer', amount: 300, accountId: acc('Cash').id, toAccountId: acc('Bank').id });
+  near(accBalance(acc('Cash').id), 500, 'Cash');
+  near(accBalance(acc('Bank').id), 800, 'Bank');
+});
+test('Account balances', 'cross-currency transfer: typed and automatic "received" amounts', () => {
+  addTx({ type: 'transfer', amount: 6000, accountId: acc('Bank').id, toAccountId: acc('Yen wallet').id, toAmount: '14000' });
+  addTx({ type: 'transfer', amount: 600, accountId: acc('Bank').id, toAccountId: acc('Yen wallet').id });
+  near(accBalance(acc('Yen wallet').id), 15500, 'Yen wallet (14000 typed + 1500 automatic)');
+  near(accBalance(acc('Bank').id), -6600, 'Bank');
+});
+
+/* ---------- change tracking ---------- */
+test('Change tracking (sync foundation)', 'saving stamps only the records that changed', () => {
+  const a = addTx({ amount: 1 }), b = addTx({ amount: 2 });
+  const bStamp = b.updated;
+  tick(1000);
+  db.transactions.find(t => t.id === a.id).note = 'changed';
+  save();
+  eq(db.transactions.find(t => t.id === a.id).updated, Date.now(), 'changed record');
+  eq(db.transactions.find(t => t.id === b.id).updated, bStamp, 'untouched record');
+});
+test('Change tracking (sync foundation)', 'deleting records a tombstone so the deletion syncs', () => {
+  const a = addTx({ amount: 1 });
+  db.transactions = db.transactions.filter(t => t.id !== a.id);
+  save();
+  ok(db.deleted[a.id] > 0, 'tombstone recorded');
+});
+test('Change tracking (sync foundation)', 'data arriving from sync is not treated as a local edit', () => {
+  const a = addTx({ amount: 1 });
+  const next = structuredClone(db);
+  next.transactions = next.transactions.filter(t => t.id !== a.id);
+  replaceDb(next);
+  ok(!db.deleted[a.id], 'no tombstone from replaceDb');
+});
+
+/* ---------- sync merging ---------- */
+test('Sync merging', 'entries added on two devices are combined', () => {
+  const base = structuredClone(db);
+  const local = structuredClone(base), remote = structuredClone(base);
+  local.transactions.push({ id: 'L', type: 'expense', date: today(), amount: 1, currency: 'PHP', updated: 5 });
+  remote.transactions.push({ id: 'R', type: 'expense', date: today(), amount: 2, currency: 'PHP', updated: 6 });
+  eq(mergeDb(local, remote).transactions.map(t => t.id).sort(), ['L', 'R']);
+});
+test('Sync merging', 'the newest edit of the same entry wins', () => {
+  const t = { id: 'X', type: 'expense', date: today(), amount: 1, currency: 'PHP' };
+  const local = { ...structuredClone(db), transactions: [{ ...t, amount: 111, updated: 10 }] };
+  const remote = { ...structuredClone(db), transactions: [{ ...t, amount: 222, updated: 20 }] };
+  eq(mergeDb(local, remote).transactions[0].amount, 222, 'remote newer');
+  local.transactions[0].updated = 30;
+  eq(mergeDb(local, remote).transactions[0].amount, 111, 'local newer');
+});
+test('Sync merging', 'a deletion beats older edits; an edit after the deletion brings it back', () => {
+  const t = { id: 'X', type: 'expense', date: today(), amount: 1, currency: 'PHP' };
+  const local = { ...structuredClone(db), transactions: [{ ...t, updated: 10 }] };
+  const remote = { ...structuredClone(db), transactions: [], deleted: { X: 20 } };
+  eq(mergeDb(local, remote).transactions.length, 0, 'deleted');
+  local.transactions[0].updated = 30;
+  eq(mergeDb(local, remote).transactions.length, 1, 'resurrected by a later edit');
+});
+test('Sync merging', 'with nothing new locally, the merge equals the synced copy (no pointless upload)', () => {
+  addTx({ amount: 5 }); addTx({ amount: 6 });
+  const remote = structuredClone(db);
+  eq(JSON.stringify(syncPayload(mergeDb(structuredClone(remote), remote))), JSON.stringify(syncPayload(remote)));
+});
+test('Sync merging', 'a device with its own data joins without duplicate categories', () => {
+  const remote = defaults();
+  const local = defaults();
+  const localFood = local.categories.find(c => c.name === 'Food');
+  local.transactions.push({ id: 'T', type: 'expense', date: today(), amount: 9, currency: 'PHP', categoryId: localFood.id, accountId: local.accounts[0].id });
+  local.budget.cats[localFood.id] = 3000;
+  reconcile(local, remote);
+  const merged = mergeDb(local, remote);
+  const remoteFood = remote.categories.find(c => c.name === 'Food');
+  eq(merged.categories.filter(c => c.name === 'Food').length, 1, 'one Food');
+  eq(merged.transactions[0].categoryId, remoteFood.id, 'entry moved to the synced Food');
+  eq(merged.budget.cats[remoteFood.id] ?? local.budget.cats[remoteFood.id], 3000, 'budget kept');
+});
+test('Sync merging', 'an untouched device is recognised as new', () => {
+  ok(isPristine(defaults()), 'fresh install');
+  addTx({ amount: 1 });
+  ok(!isPristine(db), 'after an entry');
+});
+test('Sync merging', 'encryption round-trip; a wrong passphrase is rejected', async () => {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const enc = await encryptData({ secret: 'Jollibee 194' }, 'pass-1234', salt);
+  ok(!enc.includes('Jollibee'), 'no plaintext in the stored file');
+  eq((await decryptData(enc, 'pass-1234')).data, { secret: 'Jollibee 194' });
+  let code = null;
+  try { await decryptData(enc, 'wrong-pass'); } catch (e) { code = e.code; }
+  eq(code, 'passphrase');
+});
+test('Sync merging', 'two devices end to end: connect, offline edit, reconnect, delete', async () => {
+  addTx({ amount: 250, place: 'Jollibee' });
+  await connectSync('correct horse');
+  const file = Object.values(Object.values(gists)[0].files)[0].content;
+  ok(Object.values(gists)[0].public === false, 'gist is secret');
+  ok(!file.includes('Jollibee'), 'gist is encrypted');
+
+  switchDevice('B');
+  await connectSync('wrong passphrase');
+  ok(!syncConfig(), 'wrong passphrase leaves the phone unconnected');
+  await connectSync('correct horse');
+  eq(byPlace('Jollibee').length, 1, 'phone received the laptop entry');
+
+  ONLINE = false;
+  const calls = ghCalls.length;
+  addTx({ amount: 95, place: 'Taxi (offline)' });
+  await syncNow();
+  eq(syncStatus(), 'offline-pending');
+  eq(ghCalls.length, calls, 'no network calls while offline');
+  ONLINE = true; dispatchEvent(new Event('online'));
+  await waitFor(() => !syncState.running && syncConfig().dirty === false);
+
+  switchDevice('A'); await syncNow();
+  eq(byPlace('Taxi (offline)').length, 1, 'laptop received the offline entry');
+  db.transactions = db.transactions.filter(t => t.place !== 'Taxi (offline)'); save(); clearTimeout(syncState.timer);
+  await syncNow();
+  switchDevice('B'); await syncNow();
+  eq(byPlace('Taxi (offline)').length, 0, 'deletion reached the phone');
+  disconnectSync(); switchDevice('A'); disconnectSync();
+});
+
+/* ---------- recurring ---------- */
+test('Recurring entries', 'schedule math: 31st, last day, leap years, every 2 weeks, end dates', () => {
+  const R = o => ({ id: 'x', interval: 1, end: '', ...o });
+  eq(occurrences(R({ freq: 'monthly', day: 31, start: '2026-01-31' }), '', '2026-04-30'), ['2026-01-31', '2026-02-28', '2026-03-31', '2026-04-30']);
+  eq(occurrences(R({ freq: 'monthly', day: 'last', start: '2026-01-10' }), '', '2026-03-31'), ['2026-01-31', '2026-02-28', '2026-03-31']);
+  eq(occurrences(R({ freq: 'yearly', start: '2028-02-29' }), '', '2030-03-01'), ['2028-02-29', '2029-02-28', '2030-02-28']);
+  eq(occurrences(R({ freq: 'weekly', interval: 2, start: '2026-10-02' }), '', '2026-11-01'), ['2026-10-02', '2026-10-16', '2026-10-30']);
+  eq(occurrences(R({ freq: 'monthly', day: 5, start: '2026-01-05', end: '2026-03-20' }), '', '2026-12-31'), ['2026-01-05', '2026-02-05', '2026-03-05']);
+  eq(occurrences(R({ freq: 'monthly', day: 1, start: '2026-10-15' }), '', '2026-12-15'), ['2026-11-01', '2026-12-01']);
+});
+test('Recurring entries', 'a repeating entry in the past fills in up to today', () => {
+  addTx({ amount: 15000, place: 'Rent', date: '2026-08-01', categoryId: cat('Housing').id, repeat: 'monthly:1' });
+  eq(byPlace('Rent').map(t => t.date).sort(), ['2026-08-01', '2026-09-01', '2026-10-01']);
+});
+test('Recurring entries', 'no duplicates on re-run; a deleted payment stays deleted', () => {
+  addTx({ amount: 15000, place: 'Rent', date: '2026-08-01', repeat: 'monthly:1' });
+  eq(runRecurring(), 0, 'nothing new');
+  const sep = byPlace('Rent').find(t => t.date === '2026-09-01');
+  db.transactions = db.transactions.filter(t => t.id !== sep.id); save();
+  db.recurring[0].lastRun = '2026-08-01'; // as if another device had an older copy of the rule
+  eq(runRecurring(), 0, 'not re-added');
+});
+test('Recurring entries', 'two devices adding the same payment end up with one', () => {
+  addTx({ amount: 15000, place: 'Rent', date: '2026-10-01', repeat: 'monthly:1' });
+  const other = structuredClone(db);
+  eq(mergeDb(db, other).transactions.filter(t => t.place === 'Rent').length, 1);
+});
+test('Recurring entries', 'changing the day does not add a surprise payment', () => {
+  addTx({ amount: 15000, place: 'Rent', date: '2026-10-01', repeat: 'monthly:1' });
+  actions.editRule({ dataset: { id: db.recurring[0].id } });
+  $('#r-day').value = '12'; actions.saveRule();
+  eq(byPlace('Rent').map(t => t.date), ['2026-10-01'], 'no Oct 12 payment');
+  eq(nextOccurrence(db.recurring[0]), '2026-11-12');
+});
+test('Recurring entries', 'pausing then resuming skips the missed months', () => {
+  addTx({ amount: 549, place: 'Netflix', date: '2026-10-01', repeat: 'monthly:1' });
+  actions.editRule({ dataset: { id: db.recurring[0].id } }); $('#r-paused').checked = true; actions.saveRule();
+  setClock(2026, 11, 20);
+  eq(runRecurring(), 0, 'paused');
+  actions.editRule({ dataset: { id: db.recurring[0].id } }); $('#r-paused').checked = false; actions.saveRule();
+  eq(byPlace('Netflix').map(t => t.date), ['2026-10-01'], 'no back-payments');
+  eq(nextOccurrence(db.recurring[0]), '2027-01-01');
+});
+test('Recurring entries', 'turning an existing entry into a series makes no duplicate', () => {
+  const t = addTx({ amount: 999, place: 'Globe' });
+  actions.editTx({ dataset: { id: t.id } }); $('#f-repeat').value = 'monthly:1'; saveTx();
+  eq(byPlace('Globe').length, 1);
+  ok(byPlace('Globe')[0].recurringId, 'part of a series');
+});
+test('Recurring entries', 'past occurrences get that day\'s rate later', () => {
+  addTx({ amount: 15000, place: 'Rent', date: '2026-10-01', repeat: 'monthly:1' });
+  eq(entryFromRule(db.recurring[0], '2026-09-01').fx.date, '', 'pending historical rate');
+  eq(entryFromRule(db.recurring[0], today()).fx.date, today(), 'today locked now');
+});
+
+/* ---------- deleting ---------- */
+test('Deleting accounts & categories', 'entries and series move to the chosen account', () => {
+  addTx({ amount: 15000, place: 'Rent', date: '2026-09-01', accountId: acc('Cash').id, repeat: 'monthly:1' });
+  const cashId = acc('Cash').id, bankId = acc('Bank').id;
+  deleteSheet('account', cashId);
+  ok(![...$('#del-target').options].some(o => o.value === ''), 'no "don\'t move" option when a series depends on it');
+  finishDelete('account', cashId, bankId);
+  ok(!accById(cashId), 'Cash deleted');
+  eq(db.recurring[0].template.accountId, bankId, 'series moved');
+  ok(byPlace('Rent').every(t => t.accountId === bankId), 'entries moved');
+});
+test('Deleting accounts & categories', 'plain entries may stay unmoved', () => {
+  addTx({ amount: 100, categoryId: cat('Food').id });
+  deleteSheet('category', cat('Food').id);
+  ok([...$('#del-target').options].some(o => o.value === ''), '"don\'t move" offered');
+  closeSheet();
+});
+
+/* ---------- receipts ---------- */
+test('Receipt reading', 'Philippine receipt', () => {
+  const r = parseReceipt('JOLLIBEE FOODS CORP\nSM North EDSA Branch\nVAT REG TIN 000-388-474-000\nDate: 10/14/2026 12:31\n1 Chickenjoy C1 129.00\nSUBTOTAL 194.00\nTOTAL P 194.00\nCASH 200.00\nCHANGE 6.00');
+  eq([r.total.amount, r.date, r.store, r.currency, catById(r.category.categoryId).name], [194, '2026-10-14', 'Jollibee Foods Corp', 'PHP', 'Food']);
+});
+test('Receipt reading', 'Japanese receipt with full-width digits', () => {
+  const r = parseReceipt('セブン-イレブン 渋谷道玄坂店\n電話:03-1234-5678\n2026年10月12日(月) 19:42\nおにぎり ¥160\n小計 ¥300\n合計 ¥３００\nお預り ¥1,000\nお釣 ¥700');
+  eq([r.total.amount, r.date, r.currency], [300, '2026-10-12', 'JPY']);
+});
+test('Receipt reading', 'Reiwa-era date and spaced-out OCR text', () => {
+  const r = parseReceipt('ロー ソン 新宿 三 丁 目 店\n令和8年10月3日 14:05\n合 計 \\418');
+  eq([r.total.amount, r.date, r.store], [418, '2026-10-03', 'ローソン新宿三丁目店']);
+});
+test('Receipt reading', 'messy OCR: comma decimals and O for 0', () => {
+  const r = parseReceipt('mercury drug\nBIOGESIC 2 @ 5.5O 11.00\nTOTAL AMOUNT DUE 33,50\nCASH 100.00\nCHANGE 66.50');
+  eq(r.total.amount, 33.5);
+  eq(catById(r.category.categoryId).name, 'Health');
+});
+test('Receipt reading', 'a store you have used before keeps your category', () => {
+  addTx({ amount: 500, place: 'ローソン新宿三丁目店', categoryId: cat('Daily goods').id });
+  eq(catById(parseReceipt('ローソン 新宿三丁目店\n合計 ¥418').category.categoryId).name, 'Daily goods');
+});
+
+/* ---------- budgets & summary ---------- */
+test('Budgets & monthly summary', 'left / over labels, per category', () => {
+  db.budget = { total: 1000, cats: { [cat('Food').id]: 300 }, currency: 'PHP' };
+  addTx({ amount: 400, categoryId: cat('Food').id });
+  const card = budgetCard(monthTx(2026, 9));
+  ok(card.includes('₱600.00 left'), 'total left');
+  ok(card.includes('Over by ₱100.00'), 'Food over');
+});
+test('Budgets & monthly summary', 'a budget set in yen converts for display', () => {
+  db.budget.currency = 'JPY';
+  near(budgetIn(15000), 6000);
+});
+test('Budgets & monthly summary', 'monthly summary numbers and notification text', () => {
+  addTx({ amount: 1000, date: '2026-09-10', categoryId: cat('Food').id });
+  addTx({ amount: 500, date: '2026-09-11', categoryId: cat('Transport').id });
+  addTx({ amount: 600, date: '2026-10-05', categoryId: cat('Food').id });
+  addTx({ type: 'income', amount: 2000, date: '2026-10-01', accountId: acc('Bank').id });
+  const s = monthSummary(2026, 9);
+  eq([s.exp, s.prevExp, s.inc, s.cats[0].c.name], [600, 1500, 2000, 'Food']);
+  near(s.change, -0.6);
+  const n = summaryNotification(s);
+  eq(n.title, `${new Date(2026, 9, 1).toLocaleDateString(undefined, { month: 'long' })} spending: ${money(600)}`);
+  ok(n.body.startsWith('60% less than'), n.body);
+});
+
+/* ---------- getting started guide ---------- */
+test('Getting started guide', 'finds test data from old and new versions, never your own entries', () => {
+  addSample();
+  const flagged = sampleEntries().length;
+  ok(flagged > 50, 'sample data found');
+  for (const t of db.transactions) delete t.sample; // what older versions produced
+  eq(sampleEntries().length, flagged, 'old-style sample data still found');
+  addTx({ amount: 85, place: 'Jeepney' });
+  addTx({ amount: 15000, place: 'Rent', date: '2026-08-01', repeat: 'monthly:1' });
+  const flaggedIds = new Set(sampleEntries().map(t => t.id));
+  ok(!byPlace('Jeepney').some(t => flaggedIds.has(t.id)), 'hand-typed entry kept');
+  ok(!byPlace('Rent').some(t => flaggedIds.has(t.id)), 'recurring entries kept');
+});
+test('Getting started guide', 'starting balances: today\'s balance equals what you type', () => {
+  addTx({ amount: 245, accountId: acc('Cash').id });
+  actions.guideBalances({ dataset: { mode: 'setup' } });
+  rowWith('.bal-row', 'Cash').querySelector('.bal-val').value = '2350';
+  rowWith('.bal-row', 'Bank').querySelector('.bal-val').value = '18400';
+  ok(!rowWith('.bal-row', 'Cash').querySelector('[data-act="guideBalRemove"]'), 'used account cannot be removed');
+  rowWith('.bal-row', 'Dollar account').querySelector('[data-act="guideBalRemove"]').click();
+  actions.guideBalAdd();
+  const row = [...document.querySelectorAll('.bal-row')].pop();
+  row.querySelector('.bal-name').value = 'GCash'; row.querySelector('.bal-val').value = '1200';
+  actions.guideSaveBalances();
+  near(accBalance(acc('Cash').id), 2350, 'Cash');
+  near(accBalance(acc('Bank').id), 18400, 'Bank');
+  ok(!acc('Dollar account'), 'removed');
+  eq([acc('GCash').icon, accBalance(acc('GCash').id)], ['📲', 1200]);
+  ok(guideState().accounts, 'step done');
+});
+test('Getting started guide', 'weekly check records the differences', () => {
+  acc('Cash').opening = 2000; acc('Bank').opening = 10000;
+  actions.guideBalances({ dataset: { mode: 'check' } });
+  rowWith('.bal-row', 'Cash').querySelector('.bal-val').value = '1950';
+  rowWith('.bal-row', 'Bank').querySelector('.bal-val').value = '10100';
+  actions.guideSaveBalances();
+  const short = byPlace('Unrecorded spending')[0], extra = byPlace('Balance adjustment')[0];
+  eq([short.type, short.amount, catById(short.categoryId).name], ['expense', 50, 'Other']);
+  eq([extra.type, extra.amount], ['income', 100]);
+  near(accBalance(acc('Cash').id), 1950); near(accBalance(acc('Bank').id), 10100);
+  eq(manualExpenses().length, 0, 'adjustments don\'t count as "recorded expenses"');
+});
+test('Getting started guide', 'steps tick off at the right time', () => {
+  eq(activeSteps().map(s => s.id), ['accounts', 'bills', 'budget', 'record', 'check'], 'no test-data step on a clean install');
+  addTx({ amount: 15000, place: 'Rent', date: '2026-10-01', repeat: 'monthly:1' });
+  ok(!GUIDE_STEPS.find(s => s.id === 'bills').done(), 'bills stay open after the first one');
+  setGuide({ bills: 'done' });
+  ok(GUIDE_STEPS.find(s => s.id === 'bills').done(), 'done when confirmed');
+  addTx({ amount: 1 }); addTx({ amount: 2 });
+  ok(!GUIDE_STEPS.find(s => s.id === 'record').done(), '2 of 3');
+  addTx({ amount: 3 });
+  ok(GUIDE_STEPS.find(s => s.id === 'record').done(), '3 of 3');
+});
+
+/* ---------- data ---------- */
+test('Data & backups', 'data from the first version upgrades cleanly', () => {
+  const m = migrate({
+    settings: { currency: 'PHP', theme: 'auto', weekStart: 0 },
+    accounts: [{ id: 'a1', name: 'Cash', icon: '👛', opening: 1000 }],
+    categories: [{ id: 'c1', type: 'expense', name: 'Food', icon: '🍜', color: '#f59e0b', genres: [] }],
+    transactions: [{ id: 't1', type: 'expense', date: '2026-10-10', amount: 250, categoryId: 'c1', accountId: 'a1', note: '', place: 'Jollibee' }],
+    budget: { total: 5000, cats: {} },
+  });
+  eq([m.settings.currencies, m.accounts[0].currency, m.transactions[0].currency, m.budget.currency], [['PHP'], 'PHP', 'PHP', 'PHP']);
+  ok(m.transactions[0].fx?.rates?.PHP, 'rate locked');
+  eq([m.categories[0].order, m.deleted, m.recurring, m.version], [0, {}, [], defaults().version]);
+});
+test('Data & backups', 'CSV export quotes awkward text', () => {
+  addTx({ amount: 50, place: 'Joe, "the" Diner' });
+  const csv = toCsv();
+  ok(csv.startsWith('﻿Date,Type,Category'), 'header');
+  ok(csv.includes('"Joe, ""the"" Diner"'), 'quoted');
+  ok(csv.split('\r\n')[0].includes('Currency'), 'currency column');
+});
+test('Data & backups', 'a backup restores to exactly the same data', () => {
+  addTx({ amount: 50 }); addTx({ amount: 1500, accountId: acc('Yen wallet').id });
+  addTx({ amount: 15000, place: 'Rent', date: '2026-09-01', repeat: 'monthly:1' });
+  const restored = migrate(JSON.parse(JSON.stringify(db)));
+  eq(JSON.stringify(syncPayload(restored)), JSON.stringify(syncPayload(db)));
+});
+
+/* ---------- run ---------- */
+async function run() {
+  const summary = document.getElementById('summary'), out = document.getElementById('results');
+  if (!ISOLATED) {
+    summary.innerHTML = '<span class="fail">Stopped: this browser would not let the tests use a private copy of the data, so nothing was run (your data is safe).</span>';
+    return { passed: 0, failed: 0, failures: ['not isolated'] };
+  }
+  for (const s of ['app.js', 'sync.js', 'receipt.js', 'recurring.js', 'guide.js', 'notify.js']) {
+    await new Promise((resolve, reject) => {
+      const el = document.createElement('script');
+      el.src = `${s}?fresh=${RealDate.now()}`;
+      el.onload = resolve; el.onerror = () => reject(new Error(`could not load ${s}`));
+      document.body.append(el);
+    });
+  }
+  window.toast = m => toasts.push(m);
+  await sleep(300); // let start-up work (rate refresh) settle
+  let passed = 0; const failures = []; let group = '';
+  for (const t of TESTS) {
+    if (t.group !== group) { group = t.group; out.insertAdjacentHTML('beforeend', `<div class="group">${group}</div>`); }
+    const row = document.createElement('div');
+    try {
+      await resetApp();
+      await t.fn();
+      passed++; row.className = 't pass'; row.textContent = t.name;
+    } catch (e) {
+      failures.push(`${t.group} › ${t.name}: ${e.message}`);
+      row.className = 't fail'; row.textContent = t.name;
+      const pre = document.createElement('pre'); pre.textContent = e.stack || e.message; row.append(pre);
+    }
+    out.append(row);
+    summary.textContent = `Running… ${passed + failures.length} of ${TESTS.length}`;
+  }
+  summary.innerHTML = failures.length
+    ? `<span class="fail">${failures.length} failed</span>, ${passed} passed`
+    : `<span class="pass">All ${passed} tests passed</span>`;
+  return { passed, failed: failures.length, failures };
+}
+window.testRun = run();
+</script>
+</body>
+</html>
