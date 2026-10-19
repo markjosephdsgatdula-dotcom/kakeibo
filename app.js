@@ -356,7 +356,8 @@ function budgetCard(list) {
 function viewHome() {
   const list = monthTx(ui.y, ui.m);
   const { inc, exp, net } = totals(list);
-  let html = typeof summaryBanner === 'function' ? summaryBanner() : '';
+  let html = typeof guideCard === 'function' ? guideCard() : '';
+  html += typeof summaryBanner === 'function' ? summaryBanner() : '';
   html += `<div class="card summary">
     <div><small>Income</small><b class="pos">${money(inc)}</b></div>
     <div><small>Expense</small><b class="neg">${money(exp)}</b></div>
@@ -476,7 +477,7 @@ function viewReport() {
   return html;
 }
 
-const SUBS = { sync: ['🔄', 'Sync devices'], accounts: ['🏦', 'Accounts'], recurring: ['🔁', 'Recurring'], budget: ['🎯', 'Budget'], categories: ['🏷️', 'Categories'], currencies: ['💱', 'Currencies & rates'], data: ['💾', 'Backup & data'], settings: ['⚙️', 'Settings'] };
+const SUBS = { guide: ['📘', 'Getting started'], sync: ['🔄', 'Sync devices'], accounts: ['🏦', 'Accounts'], recurring: ['🔁', 'Recurring'], budget: ['🎯', 'Budget'], categories: ['🏷️', 'Categories'], currencies: ['💱', 'Currencies & rates'], data: ['💾', 'Backup & data'], settings: ['⚙️', 'Settings'] };
 
 function viewMore() {
   if (ui.sub) return SUBVIEWS[ui.sub]();
@@ -858,13 +859,13 @@ function addSample() {
   for (let mo = 0; mo < 3; mo++) {
     const base = new Date(now.getFullYear(), now.getMonth() - mo, 1);
     const days = mo === 0 ? now.getDate() : new Date(base.getFullYear(), base.getMonth() + 1, 0).getDate();
-    if (salary) db.transactions.push({ id: uid(), type: 'income', date: ymd(base), amount: 35000, currency: pesoAcc.currency, categoryId: salary.id, genre: '', accountId: pesoAcc.id, place: 'Employer', note: '', created: Date.now() });
+    if (salary) db.transactions.push({ id: uid(), type: 'income', date: ymd(base), amount: 35000, currency: pesoAcc.currency, categoryId: salary.id, genre: '', accountId: pesoAcc.id, place: 'Employer', note: '', created: Date.now(), sample: true });
     for (let i = 0; i < days * 1.5; i++) {
       const c = pick(exp), acc = pick(db.accounts);
       db.transactions.push({
         id: uid(), type: 'expense', date: ymd(new Date(base.getFullYear(), base.getMonth(), 1 + Math.floor(Math.random() * days))),
         amount: roundMoney(conv(50 + Math.random() * 900, 'PHP', acc.currency), acc.currency), currency: acc.currency,
-        categoryId: c.id, genre: c.genres.length ? pick(c.genres) : '', accountId: acc.id, place: pick(places), note: '', created: Date.now(),
+        categoryId: c.id, genre: c.genres.length ? pick(c.genres) : '', accountId: acc.id, place: pick(places), note: '', created: Date.now(), sample: true,
       });
     }
   }

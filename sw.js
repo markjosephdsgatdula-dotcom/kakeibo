@@ -1,5 +1,5 @@
 // Bump VERSION whenever you deploy changes so clients pick up the new files.
-const VERSION = 'kakeibo-v9';
+const VERSION = 'kakeibo-v10';
 // Version-pinned third-party files (the receipt reader). Kept across app updates; they never change.
 const CDN_CACHE = 'kakeibo-cdn-v1';
 const ASSETS = [
@@ -11,6 +11,7 @@ const ASSETS = [
   './receipt.js',
   './notify.js',
   './recurring.js',
+  './guide.js',
   './icons/badge-96.png',
   './manifest.webmanifest',
   './icons/icon-192.png',
